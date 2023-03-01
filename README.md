@@ -4,6 +4,38 @@ Authors' implementation of Chain-of-Hindsight which is proposed in [Chain of Hin
 
 The implementation is in Jax/Flax. It supports both small-scale (several TPUs/GPUs) and large-scale (hunders and thousands of TPUs/GPUs) training and inference.
 
+## Codebase structure
+
+```bash
+.
+├── coh
+│   ├── data
+│   │   ├── hf_data.py # data loader for human feedback datasets
+│   │   ├── pt_data.py # data loader for pretraining datasets
+│   │   ├── templates.py # templates for generating chain of hindsight
+│   ├── coh_train.py # main training script
+│   ├── models
+│   │   ├── gptj
+│   │   │   ├── gptj.py # GPT-J model
+│   │   │   ├── gptj_train.py # GPT-J training script
+│   │   ├── opt
+│   │   │   ├── opt.py # OPT model
+│   │   │   ├── opt_train.py # OPT training script
+│   ├── scripts
+│   │   ├── lm_eval.py # evaluation script
+│   │   ├── lm_serve.py # serving script
+│   │   ├── serving.py # serving helper functions
+│   ├── utils.py # helper functions
+│   ├── jax_utils.py # jax helper functions
+├── scripts
+│   └── gpu_enviroment.yml  # conda environment for GPU hosts
+│   └── tpu_vm_setup.sh  # script for installing dependencies on TPU hosts
+│   └── tpu_util.sh  # script for starting/stopping TPU VMs
+├── scripts  # scripts for evaluation
+│    dataset_builders  # scripts used to generate some of the datasets
+├── resources  # small, git-tracked files from which lists of words or prompts are loaded
+└── train.py  # the main training script
+```
 
 # Installation
 The installation method differs between GPU hosts and Cloud TPU hosts. Please follow the instructions below.

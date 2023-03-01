@@ -58,6 +58,8 @@ class HumanFeedbackDataset(object):
                 processed = self.format_to_sentence(sample)
                 tokens.extend(processed['input_tokens'])
                 masks.extend(processed['loss_masks'])
+                tokens.append(self.tokenizer.eos_token_id)
+                masks.append(1)
                 while len(tokens) > chunk_size:
                     yield {
                         'tokens': np.array(tokens[:chunk_size], dtype=np.int32).reshape(
