@@ -58,7 +58,7 @@ The tpu_util.sh is a useful script used to start a TPU VM and install dependenci
 # Usage
 
 
-# I want to train CoH.
+## I want to train CoH
 
 ```shell
 python3 -m coh.coh_train \
@@ -85,17 +85,17 @@ python3 -m coh.coh_train \
 This will finetune a 6B model GPT-J on human feedback datasets.
 You can choose model from GPT-J and OPT models to finetune, it loads pretrained models from HuggingFace. The default setting is to finetune on GPT-J.
 
-# I want to train SFT.
+## I want to train SFT
 
 Just disable the usage of chain of hindsight, then it will finetune on the positive or negative feedback datasets without using chain of hindsight, i.e., the length is fixed to one.
 You probably want to exclude negative feedback datasets from the training set, otherwise the model will be biased towards negative feedback.
 
-# I want to train RLHF.
+## I want to train RLHF
 
 Not being supported in this codebase, an implementation (in PyTorch) is available at [trlx](https://github.com/CarperAI/trlx)
 
 
-# I want to do evaluation.
+## I want to do evaluation
 
 ```shell
 python -m coh.scripts.lm_serve \
@@ -119,13 +119,13 @@ python -m coh.scripts.lm_eval \
 Full list of tasks can be found at [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness).
 
 
-# I want to do human evaluation.
+## I want to do human evaluation
 
 Not being supported in this codebase, please refer to the paper (experiment settings and appendix) for more details of setting up the human evaluation.
-We found pairwise comparisons are more reliable than rating multiple methods at the same time.
+Note to use pairwise comparisons which are more reliable than rating multiple methods at the same time.
 
 
-# I wan to do pretraining / finetuning without human feedback / preference.
+## I wan to do pretraining / finetuning without human feedback / preference.
 
 GPT-J
 ```shell
