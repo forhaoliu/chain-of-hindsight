@@ -1,10 +1,10 @@
-# CoH's Jax Implementation
+# CoH's Implementation
 
-Authors' implementation of Chain-of-Hindsight which is proposed in [Chain of Hindsight aligns Language Models with Feedback](https://arxiv.org/abs/2302.02676).
+Authors' implementation of Chain-of-Hindsight which is proposed in [Chain of Hindsight aligns Language Models with Feedback](https://arxiv.org/abs/2302.02676) in Jax.
 
-The implementation is in Jax/Flax. It supports both small-scale (several TPUs/GPUs) and large-scale (hunders and thousands of TPUs/GPUs) training and inference.
+This implementation allows GPT model training and inference at both small (few TPUs/GPUs) and large (hundreds/thousands of TPUs/GPUs) scales through the use of data and model parallelism.
 
-## Codebase structure
+# Codebase structure
 
 ```bash
 .
