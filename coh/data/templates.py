@@ -53,8 +53,8 @@ dialogue_template = [
 
 
 webgpt_tie_template = [
-    ("a good answer is {pos}", "{neg} is a good answer"),
-    ("the following is a good answer {pos}", "the following is a bad answer {neg}"),
+    ("a good answer is {pos}", "a good answer is {neg}"),
+    ("the following is a good answer {pos}", "the following is a good answer {neg}"),
     ("generate a good answer: {pos}", "generate a good answer: {neg}"),
     ("the following are two equally good answers {pos} and {neg}", "the following are two equally good answers {neg} and {pos}"),
     ("the following are two equally preferred answers {pos} and {neg}", "the following are two equally preferred answers {neg} and {pos}"),
