@@ -132,6 +132,7 @@ def main(argv):
         rng_generator = JaxRNG(rng)
         tokens = with_sharding_constraint(batch['tokens'], PS('dp'))
         pt_tokens = with_sharding_constraint(pt_batch['tokens'], PS('dp'))
+        loss_masks = with_sharding_constraint(batch['masks'], PS('dp'))
         def loss_and_accuracy(params):
             bos_tokens = jnp.full(
                 (tokens.shape[0], 1), config.bos_token_id, dtype=jnp.int32
@@ -142,7 +143,7 @@ def main(argv):
                 params, inputs, deterministic=False,
                 rngs=rng_generator(config.rng_keys()),
             ).logits
-            hf_loss, hf_accuracy = cross_entropy_loss_and_accuracy(logits, tokens)
+            hf_loss, hf_accuracy = cross_entropy_loss_and_accuracy(logits, tokens, loss_masks)
             # general pretrain data
             bos_tokens = jnp.full(
                 (pt_tokens.shape[0], 1), config.bos_token_id, dtype=jnp.int32

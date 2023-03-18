@@ -4,6 +4,8 @@ Authors' implementation of Chain-of-Hindsight which is proposed in [Chain of Hin
 
 This implementation allows GPT model training and inference at both small (few TPUs/GPUs) and large (hundreds/thousands of TPUs/GPUs) scales through the use of data and model parallelism.
 
+*We are currently working on an improved version of CoH, which comes better extensibility and results, stay tuned.*
+
 # Codebase structure
 
 ```bash
