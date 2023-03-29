@@ -15,41 +15,41 @@
 # limitations under the License.
 
 
-import inspect
 from functools import partial
 from typing import Optional, Tuple
+import json
+
+import numpy as np
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
-from flax.linen import partitioning as nn_partitioning
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
+from flax.linen import partitioning as nn_partitioning
+
+from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxCausalLMOutput
+from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
+from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
+from transformers import AutoTokenizer
 from jax.experimental import PartitionSpec
-from jax.experimental.pjit import with_sharding_constraint
-from jax.interpreters import pxla
+
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
-from transformers import AutoTokenizer
-from transformers.configuration_utils import PretrainedConfig
-from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
-from transformers.modeling_flax_outputs import (FlaxBaseModelOutput,
-                                                FlaxCausalLMOutput)
-from transformers.modeling_flax_utils import (ACT2FN, FlaxPreTrainedModel,
-                                              append_call_sample_docstring)
-from transformers.utils import (add_start_docstrings,
-                                add_start_docstrings_to_model_forward, logging)
+from coh.utils import function_args_to_config, load_pickle, open_file
 
-from coh.utils import function_args_to_config, load_pickle
+from coh.jax_utils import with_sharding_constraint
+
 
 """
 The follow code is taken from
 transformers/src/transformers/models/gptj/configuration_gptj.py
-and modified to work with EasyLM.
+and modified to work with coh.
 """
 
 
@@ -245,9 +245,11 @@ class GPTJConfig(PretrainedConfig):
         )
 
     @staticmethod
-    def load_pretrained(name):
+    def load_pretrained(name, dtype=jnp.float32):
         with jax.default_device(jax.devices("cpu")[0]):
-            params = FlaxGPTJForCausalLM.from_pretrained(name, _do_init=False)[1]
+            params = FlaxGPTJForCausalLM.from_pretrained(
+                name, _do_init=False, dtype=dtype
+            )[1]
             params = freeze({'params': params})
         return params
 
@@ -256,6 +258,10 @@ class GPTJConfig(PretrainedConfig):
         load_type, load_path = path.split('::', 1)
         if load_type == 'pickle':
             return cls.from_dict(load_pickle(load_path)['gptj_config'])
+        elif load_type == 'json':
+            with open_file(load_path, 'r') as fin:
+                raw_config = fin.read()
+            return cls.from_dict(json.loads(raw_config))
         elif load_type == 'huggingface':
             return cls.from_pretrained(load_path)
         else:
@@ -265,7 +271,7 @@ class GPTJConfig(PretrainedConfig):
 """
 The follow code is taken from
 transformers/src/transformers/models/gptj/modeling_flax_gptj.py
-and modified to work with EasyLM.
+and modified to work with coh.
 """
 
 logger = logging.get_logger(__name__)
@@ -457,11 +463,8 @@ class FlaxGPTJAttention(nn.Module):
         sincos = jnp.take(self.embed_positions, position_ids, axis=0)
         sincos = jnp.split(sincos, 2, axis=-1)
         # Rotary position embeddings induce some weird issues in multi-host environments, so we remove activation-sharding for keys/query vectors to fix this.
-        resource_env = pxla.thread_resources.env
-        mesh = resource_env.physical_mesh
-        if "dp" in mesh.axis_names:
-            key = with_sharding_constraint(key, PartitionSpec("dp", None, None, None))
-            query = with_sharding_constraint(query, PartitionSpec("dp", None, None, None))
+        # key = with_sharding_constraint(key, PartitionSpec("dp", None, None, None))
+        # query = with_sharding_constraint(query, PartitionSpec("dp", None, None, None))
         if self.rotary_dim is not None and self.rotary_dim > 0:
             k_rot = key[:, :, :, : self.rotary_dim]
             k_pass = key[:, :, :, self.rotary_dim :]
@@ -935,7 +938,7 @@ class FlaxGPTJForCausalLMModule(nn.Module):
             attention_mask = jnp.ones_like(input_ids)
         if position_ids is None:
             position_ids = jnp.broadcast_to(
-                jnp.cumsum(attention_mask, axis=-1) - 1,
+                jnp.clip(jnp.cumsum(attention_mask, axis=-1) - 1, a_min=0),
                 (batch_size, seq_length)
             )
 

@@ -16,32 +16,34 @@
 
 from functools import partial
 from typing import Optional, Tuple
+import json
+
+import numpy as np
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 from flax.core.frozen_dict import FrozenDict, freeze, unfreeze
 from flax.linen import combine_masks, make_causal_mask
-from flax.linen import partitioning as nn_partitioning
 from flax.linen.attention import dot_product_attention_weights
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax import lax
+from flax.linen import partitioning as nn_partitioning
+
+from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_flax_outputs import FlaxBaseModelOutput, FlaxMaskedLMOutput
+from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append_call_sample_docstring
+from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
+from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
+from transformers import AutoTokenizer
 from jax.experimental import PartitionSpec
-from jax.experimental.pjit import with_sharding_constraint
-from jax.interpreters import pxla
+
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
-from transformers import AutoTokenizer
-from transformers.configuration_utils import PretrainedConfig
-from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
-from transformers.modeling_flax_outputs import (FlaxBaseModelOutput,
-                                                FlaxMaskedLMOutput)
-from transformers.modeling_flax_utils import (ACT2FN, FlaxPreTrainedModel,
-                                              append_call_sample_docstring)
-from transformers.utils import (add_start_docstrings,
-                                add_start_docstrings_to_model_forward, logging)
+from coh.utils import function_args_to_config, load_pickle, open_file
 
-from coh.utils import function_args_to_config, load_pickle
+from coh.jax_utils import with_sharding_constraint
+
 
 remat = nn_partitioning.remat
 
@@ -239,8 +241,7 @@ class OPTConfig(PretrainedConfig):
     @classmethod
     def get_default_config(cls, updates=None):
         none_arg_types = dict(
-            n_inner=int,
-            rotary_dim=int,
+            word_embed_proj_dim=int,
         )
         config = function_args_to_config(cls.__init__, none_arg_types=none_arg_types)
 
@@ -287,12 +288,7 @@ class OPTConfig(PretrainedConfig):
     @staticmethod
     def get_tokenizer_config(updates=None):
         config = ConfigDict()
-        config.name = 'facebook/opt-350m'
-        config.bos_token = '</s>'
-        config.eos_token = '</s>'
-        config.pad_token = '</s>'
-        config.cls_token = '</s>'
-        config.mask_token = '</s>'
+        config.name = 'patrickvonplaten/opt-30b'
 
         if updates is not None:
             config.update(ConfigDict(updates).copy_and_resolve_references())
@@ -300,22 +296,20 @@ class OPTConfig(PretrainedConfig):
         return config
 
     @classmethod
-    def get_tokenizer(cls, config, padding_side='left'):
+    def get_tokenizer(cls, config, padding_side='left', truncation_side='right'):
         config = cls.get_tokenizer_config(config)
         return AutoTokenizer.from_pretrained(
             config.name,
-            bos_token=config.bos_token,
-            eos_token=config.eos_token,
-            pad_token=config.pad_token,
-            cls_token=config.cls_token,
-            mask_token=config.mask_token,
             padding_side=padding_side,
+            truncation_side=truncation_side,
         )
 
     @staticmethod
-    def load_pretrained(name):
+    def load_pretrained(name, dtype=jnp.float32):
         with jax.default_device(jax.devices("cpu")[0]):
-            params = FlaxOPTForCausalLM.from_pretrained(name, _do_init=False)[1]
+            params = FlaxOPTForCausalLM.from_pretrained(
+                name, _do_init=False, dtype=dtype
+            )[1]
             params = freeze({'params': params})
         return params
 
@@ -323,7 +317,11 @@ class OPTConfig(PretrainedConfig):
     def load_config(cls, path):
         load_type, load_path = path.split('::', 1)
         if load_type == 'pickle':
-            return load_pickle(load_path)['gptj_config']
+            return cls.from_dict(load_pickle(load_path)['gptj_config'])
+        elif load_type == 'json':
+            with open_file(load_path, 'r') as fin:
+                raw_config = fin.read()
+            return cls.from_dict(json.loads(raw_config))
         elif load_type == 'huggingface':
             return cls.from_pretrained(load_path)
         else:

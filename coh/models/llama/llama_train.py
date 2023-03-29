@@ -26,16 +26,18 @@ from coh.jax_utils import (
     set_random_seed, average_metrics, get_weight_decay_mask,
     make_shard_and_gather_fns, tree_apply
 )
-from coh.models.opt.opt_model import OPTConfig, FlaxOPTForCausalLMModule
+from coh.models.llama.llama_model import (
+    LLaMAConfig, FlaxLLaMAForCausalLM, FlaxLLaMAForCausalLMModule
+)
 
 
 FLAGS, FLAGS_DEF = utils.define_flags_with_default(
     seed=42,
     initialize_jax_distributed=False,
-    mp_mesh_dim=-1,
+    mp_mesh_dim='1,-1',
     total_steps=10000,
-    load_opt_config='',
-    update_opt_config='',
+    load_llama_config='',
+    update_llama_config='',
     load_checkpoint='',
     load_dataset_state='',
     log_freq=50,
@@ -43,11 +45,11 @@ FLAGS, FLAGS_DEF = utils.define_flags_with_default(
     save_milestone_freq=0,
     save_optimizer_state=False,
     eval_steps=0,
-    tokenizer=OPTConfig.get_tokenizer_config(),
+    tokenizer=LLaMAConfig.get_tokenizer_config(),
     train_dataset=PretrainDataset.get_default_config(),
     eval_dataset=PretrainDataset.get_default_config(),
     optimizer=OptimizerFactory.get_default_config(),
-    opt=OPTConfig.get_default_config(),
+    llama=LLaMAConfig.get_default_config(),
     logger=utils.WandBLogger.get_default_config(),
     log_all_worker=False,
 )
@@ -69,7 +71,7 @@ def main(argv):
     if FLAGS.load_dataset_state != '':
         dataset = utils.load_pickle(FLAGS.load_dataset_state)
     else:
-        tokenizer = OPTConfig.get_tokenizer(FLAGS.tokenizer)
+        tokenizer = LLaMAConfig.get_tokenizer(FLAGS.tokenizer)
         dataset = PretrainDataset.load_dataset(FLAGS.train_dataset, tokenizer)
 
     if FLAGS.eval_steps > 0:
@@ -80,25 +82,25 @@ def main(argv):
 
     seq_length = dataset.seq_length
 
-    if FLAGS.load_opt_config != '':
-        opt_config = OPTConfig.load_config(FLAGS.load_opt_config)
+    if FLAGS.load_llama_config != '':
+        llama_config = LLaMAConfig.load_config(FLAGS.load_llama_config)
     else:
-        opt_config = OPTConfig(**FLAGS.opt)
+        llama_config = LLaMAConfig(**FLAGS.llama)
 
-    if FLAGS.update_opt_config != '':
-        opt_config.update(dict(eval(FLAGS.update_opt_config)))
+    if FLAGS.update_llama_config != '':
+        llama_config.update(dict(eval(FLAGS.update_llama_config)))
 
-    opt_config.update(dict(
+    llama_config.update(dict(
         bos_token_id=dataset.tokenizer.bos_token_id,
         eos_token_id=dataset.tokenizer.eos_token_id,
     ))
-    if opt_config.vocab_size < dataset.vocab_size:
-        opt_config.update(dict(vocab_size=dataset.vocab_size))
-    model = FlaxOPTForCausalLMModule(opt_config)
+    if llama_config.vocab_size < dataset.vocab_size:
+        llama_config.update(dict(vocab_size=dataset.vocab_size))
+    model = FlaxLLaMAForCausalLMModule(llama_config)
 
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
         FLAGS.optimizer,
-        get_weight_decay_mask(OPTConfig.get_weight_decay_exclusions()),
+        get_weight_decay_mask(LLaMAConfig.get_weight_decay_exclusions())
     )
 
     def create_trainstate_from_params(params):
@@ -110,7 +112,7 @@ def main(argv):
             input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
-            rngs=rng_generator(opt_config.rng_keys()),
+            rngs=rng_generator(llama_config.rng_keys()),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
@@ -120,12 +122,12 @@ def main(argv):
         loss_masks = with_sharding_constraint(batch['loss_masks'], PS('dp'))
         def loss_and_accuracy(params):
             bos_tokens = jnp.full(
-                (tokens.shape[0], 1), opt_config.bos_token_id, dtype=jnp.int32
+                (tokens.shape[0], 1), llama_config.bos_token_id, dtype=jnp.int32
             )
             inputs = jnp.concatenate([bos_tokens, tokens[:, :-1]], axis=1)
             logits = model.apply(
                 params, inputs, deterministic=False,
-                rngs=rng_generator(opt_config.rng_keys()),
+                rngs=rng_generator(llama_config.rng_keys()),
             ).logits
             return cross_entropy_loss_and_accuracy(logits, tokens, loss_masks)
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
@@ -145,12 +147,12 @@ def main(argv):
         tokens = with_sharding_constraint(batch['tokens'], PS('dp'))
         loss_masks = with_sharding_constraint(batch['loss_masks'], PS('dp'))
         bos_tokens = jnp.full(
-            (tokens.shape[0], 1), opt_config.bos_token_id, dtype=jnp.int32
+            (tokens.shape[0], 1), llama_config.bos_token_id, dtype=jnp.int32
         )
         inputs = jnp.concatenate([bos_tokens, tokens[:, :-1]], axis=1)
         logits = model.apply(
             train_state.params, inputs, deterministic=True,
-            rngs=rng_generator(opt_config.rng_keys()),
+            rngs=rng_generator(llama_config.rng_keys()),
         ).logits
         loss, accuracy = cross_entropy_loss_and_accuracy(logits, tokens, loss_masks)
         metrics = dict(
@@ -161,7 +163,7 @@ def main(argv):
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
-        OPTConfig.get_partition_rules(), train_state_shapes
+        LLaMAConfig.get_partition_rules(), train_state_shapes
     )
 
     shard_fns, gather_fns = make_shard_and_gather_fns(
@@ -205,7 +207,7 @@ def main(argv):
             step=step,
             variant=variant,
             flags=flags_config_dict,
-            opt_config=opt_config.to_dict(),
+            llama_config=llama_config.to_dict(),
         )
         checkpointer.save_all(
             train_state=train_state,
@@ -216,19 +218,13 @@ def main(argv):
         )
 
     mesh = get_jax_mp_mesh(FLAGS.mp_mesh_dim)
+    assert len(mesh.shape) == 3, 'MP mesh must be 2D'
     with mesh:
         train_state, restored_params = None, None
         if FLAGS.load_checkpoint != '':
-            load_type, load_path = FLAGS.load_checkpoint.split('::', 1)
-            if load_type == 'huggingface':
-                restored_params = tree_apply(
-                    shard_fns.params, opt_config.load_pretrained(load_path)
-                )
-                train_state = None
-            else:
-                train_state, restored_params = checkpointer.load_trainstate_checkpoint(
-                    FLAGS.load_checkpoint, train_state_shapes, shard_fns
-                )
+            train_state, restored_params = checkpointer.load_trainstate_checkpoint(
+                FLAGS.load_checkpoint, train_state_shapes, shard_fns
+            )
 
         if train_state is None and restored_params is None:
             # Initialize from scratch

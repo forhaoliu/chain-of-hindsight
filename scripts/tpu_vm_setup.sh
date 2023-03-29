@@ -14,8 +14,6 @@ sudo apt-get update && sudo apt-get install -y \
     patchelf \
     golang
 
-mkdir -p ~/.mujoco && curl -s https://mujoco.org/download/mujoco210-linux-x86_64.tar.gz | tar xvz -C ~/.mujoco
-
 # Python dependencies
 cat > $HOME/tpu_requirements.txt <<- EndOfFile
 -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
@@ -23,31 +21,30 @@ jax[tpu]==0.3.25
 tensorflow==2.11.0
 flax==0.6.0
 optax==0.1.3
+chex==0.1.5
 distrax==0.1.2
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==1.12.1
-transformers==4.26.0
-datasets==2.7.0
+transformers==4.27.2
+huggingface_hub==0.13.3
+datasets==2.9.0
 tqdm
 ml_collections
 wandb==0.13.5
 gcsfs==2022.11.0
 requests
 typing-extensions
+lm-eval==0.3.0
+sentencepiece
+pydantic
+fastapi
+uvicorn
+gradio
 evaluate==0.3.0
-mujoco-py==2.1.2.14
-gym[mujoco_py,classic_control]==0.23.0
-git+https://github.com/Farama-Foundation/d4rl@master#egg=d4rl
-lm-eval
-click
-flask
-jax-smi
 pyext==0.7
-dm_control==1.0.9
-dm_env==1.6
 EndOfFile
 
-pip install -r $HOME/tpu_requirements.txt
+pip install --upgrade -r $HOME/tpu_requirements.txt
 
 
 # vim configurations

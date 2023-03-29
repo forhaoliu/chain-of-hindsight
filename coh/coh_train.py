@@ -1,65 +1,73 @@
 import dataclasses
 import pprint
-import re
 from functools import partial
+import re
 
-import absl.app
-import absl.flags
-import flax
+from tqdm import tqdm, trange
+import numpy as np
+import coh.utils as utils
+
 import jax
 import jax.numpy as jnp
-import numpy as np
-import optax
+from jax.experimental.pjit import pjit, with_sharding_constraint
+from jax.experimental import PartitionSpec as PS
+import flax
 from flax import linen as nn
 from flax.jax_utils import prefetch_to_device
 from flax.training.train_state import TrainState
-from jax.experimental import PartitionSpec as PS
-from jax.experimental.pjit import pjit, with_sharding_constraint
-from tqdm import tqdm, trange
+import optax
 
-from coh.data import HumanFeedbackDataset, PretrainDataset
-from coh.jax_utils import (JaxRNG, ShardingHelper, StreamingCheckpointer,
-                          cross_entropy_loss_and_accuracy, get_jax_mp_mesh,
-                          global_norm, match_partition_rules, named_tree_map,
-                          next_rng, set_random_seed, get_metrics, OptimizerFactory)
-from coh.utils import (WandBLogger, define_flags_with_default, get_user_flags,
-                      load_pickle, user_flags_to_config_dict)
-from coh.models.gptj.gptj import FlaxGPTJForCausalLMModule, GPTJConfig
-from coh.models.opt.opt import FlaxOPTForCausalLMModule, OPTConfig
+from coh.data import DatasetOption
+from coh.checkpoint import StreamingCheckpointer
+from coh.optimizers import OptimizerFactory
+from coh.jax_utils import (
+    JaxRNG, get_jax_mp_mesh, next_rng, match_partition_rules,
+    cross_entropy_loss_and_accuracy, named_tree_map, global_norm,
+    set_random_seed, average_metrics, get_weight_decay_mask,
+    make_shard_and_gather_fns, tree_apply
+)
+from coh.models.gptj.gptj_model import GPTJConfig, FlaxGPTJForCausalLMModule
+from coh.models.opt.opt_model import OPTConfig, FlaxOPTForCausalLMModule
 
 
-FLAGS_DEF = define_flags_with_default(
+FLAGS, FLAGS_DEF = utils.define_flags_with_default(
     seed=42,
     initialize_jax_distributed=False,
-    mp_mesh_dim=1,
+    mp_mesh_dim=-1,
     total_steps=10000,
+    load_gptj_config='',
+    update_gptj_config='',
+    load_opt_config='',
+    update_opt_config='',
     load_checkpoint='',
     load_dataset_state='',
     log_freq=50,
     save_model_freq=0,
-    optimizer=OptimizerFactory.get_default_config(),
+    save_milestone_freq=0,
+    save_optimizer_state=False,
+    eval_steps=0,
     tokenizer=GPTJConfig.get_tokenizer_config(),
-    feedback_dataset=HumanFeedbackDataset.get_default_config(),
-    pretrain_dataset=PretrainDataset.get_default_config(),
-    pt_loss_weight=1.0,
+    hf_train_dataset=DatasetOption.get_default_config(),
+    pt_train_dataset=DatasetOption.get_default_config(),
+    hf_eval_dataset=DatasetOption.get_default_config(),
+    pt_eval_dataset=DatasetOption.get_default_config(),
+    pt_loss_weight=0.01,
+    optimizer=OptimizerFactory.get_default_config(),
     gptj=GPTJConfig.get_default_config(),
-    load_gptj_config='',
     opt=OPTConfig.get_default_config(),
-    load_opt_config='',
     model='gptj',
-    logger=WandBLogger.get_default_config(),
+    logger=utils.WandBLogger.get_default_config(),
     log_all_worker=False,
 )
 
 
 def main(argv):
-    FLAGS = absl.app.flags.FLAGS
     if FLAGS.initialize_jax_distributed:
         jax.distributed.initialize()
 
-    variant = get_user_flags(FLAGS, FLAGS_DEF)
-    flags_config_dict = user_flags_to_config_dict(FLAGS, FLAGS_DEF)
-    logger = WandBLogger(
+    variant = utils.get_user_flags(FLAGS, FLAGS_DEF)
+    flags_config_dict = utils.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
+    logger = utils.WandBLogger(
         config=FLAGS.logger,
         variant=variant,
         enable=FLAGS.log_all_worker or (jax.process_index() == 0),
@@ -68,13 +76,29 @@ def main(argv):
 
     if FLAGS.load_dataset_state != '':
         hf, pt = FLAGS.load_dataset_state.split(',')
-        hf_dataset = load_pickle(hf)
-        pt_dataset = load_pickle(pt)
+        hf_dataset = utils.load_pickle(hf)
+        pt_dataset = utils.load_pickle(pt)
     else:
-        tokenizer = GPTJConfig.get_tokenizer(FLAGS.tokenizer)
-        hf_dataset = HumanFeedbackDataset(FLAGS.feedback_dataset, tokenizer)
-        pt_dataset = PretrainDataset(FLAGS.pretrain_dataset, tokenizer)
+        if FLAGS.model == 'gptj':
+            tokenizer = GPTJConfig.get_tokenizer(FLAGS.tokenizer)
+        elif FLAGS.model == 'opt':
+            tokenizer = OPTConfig.get_tokenizer(FLAGS.tokenizer)
+        else:
+            raise ValueError(f'Unknown model: {FLAGS.model}')
+        hf_dataset = DatasetOption.load_dataset(FLAGS.hf_train_dataset, tokenizer)
+        pt_dataset = DatasetOption.load_dataset(FLAGS.pt_train_dataset, tokenizer)
 
+    if FLAGS.eval_steps > 0:
+        hf_eval_dataset = DatasetOption.load_dataset(
+            FLAGS.hf_eval_dataset, hf_dataset.tokenizer
+        )
+        pt_eval_dataset = DatasetOption.load_dataset(
+            FLAGS.pt_eval_dataset, pt_dataset.tokenizer
+        )
+        hf_eval_iterator = iter(hf_eval_dataset)
+        pt_eval_iterator = iter(pt_eval_dataset)
+
+    assert hf_dataset.seq_length == pt_dataset.seq_length, "HF and PT datasets must have the same sequence length."
     seq_length = hf_dataset.seq_length
 
     if FLAGS.model == 'gptj':
@@ -82,11 +106,14 @@ def main(argv):
             gptj_config = GPTJConfig.load_config(FLAGS.load_gptj_config)
         else:
             gptj_config = GPTJConfig(**FLAGS.gptj)
+        if FLAGS.update_gptj_config != '':
+            gptj_config.update(dict(eval(FLAGS.update_gptj_config)))
         gptj_config.update(dict(
-            bos_token_id=hf_dataset.tokenizer.bos_token_id,
-            eos_token_id=hf_dataset.tokenizer.eos_token_id,
-            vocab_size=hf_dataset.vocab_size,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         ))
+        if gptj_config.vocab_size < len(tokenizer):
+            gptj_config.update(dict(vocab_size=len(tokenizer)))
         model = FlaxGPTJForCausalLMModule(gptj_config)
         config = gptj_config
     elif FLAGS.model == 'opt':
@@ -94,29 +121,26 @@ def main(argv):
             opt_config = OPTConfig.load_config(FLAGS.load_opt_config)
         else:
             opt_config = OPTConfig(**FLAGS.opt)
-
+        if FLAGS.update_opt_config != '':
+            opt_config.update(dict(eval(FLAGS.update_opt_config)))
         opt_config.update(dict(
-            bos_token_id=hf_dataset.tokenizer.bos_token_id,
-            eos_token_id=hf_dataset.tokenizer.eos_token_id,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         ))
-        if opt_config.vocab_size < hf_dataset.vocab_size:
-            opt_config.update(dict(vocab_size=hf_dataset.vocab_size))
+        if opt_config.vocab_size < len(tokenizer):
+            opt_config.update(dict(vocab_size=len(tokenizer)))
         model = FlaxOPTForCausalLMModule(opt_config)
         config = opt_config
     else:
         raise ValueError(f'Unknown model: {FLAGS.model}')
 
-    def weight_decay_mask(params):
-        def decay(name, _):
-            for rule in GPTJConfig.get_weight_decay_exclusions():
-                if re.search(rule, name) is not None:
-                    return False
-            return True
-        return named_tree_map(decay, params, sep='/')
-
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
-        FLAGS.optimizer, weight_decay_mask
+        FLAGS.optimizer,
+        get_weight_decay_mask(GPTJConfig.get_weight_decay_exclusions()),
     )
+
+    def create_trainstate_from_params(params):
+        return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
@@ -128,66 +152,88 @@ def main(argv):
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
-    def train_step(train_state, rng, batch, pt_batch):
+    def train_step(train_state, rng, hf_batch, pt_batch):
         rng_generator = JaxRNG(rng)
-        tokens = with_sharding_constraint(batch['tokens'], PS('dp'))
-        pt_tokens = with_sharding_constraint(pt_batch['tokens'], PS('dp'))
-        loss_masks = with_sharding_constraint(batch['masks'], PS('dp'))
-        def loss_and_accuracy(params):
+        def loss_and_accuracy(params, batch):
+            tokens = with_sharding_constraint(batch['tokens'], PS('dp'))
+            loss_masks = with_sharding_constraint(batch['loss_masks'], PS('dp'))
             bos_tokens = jnp.full(
                 (tokens.shape[0], 1), config.bos_token_id, dtype=jnp.int32
             )
-            # human feedback data
             inputs = jnp.concatenate([bos_tokens, tokens[:, :-1]], axis=1)
             logits = model.apply(
                 params, inputs, deterministic=False,
                 rngs=rng_generator(config.rng_keys()),
             ).logits
-            hf_loss, hf_accuracy = cross_entropy_loss_and_accuracy(logits, tokens, loss_masks)
-            # general pretrain data
-            bos_tokens = jnp.full(
-                (pt_tokens.shape[0], 1), config.bos_token_id, dtype=jnp.int32
-            )
-            pt_inputs = jnp.concatenate([bos_tokens, pt_tokens[:, :-1]], axis=1)
-            pt_logits = model.apply(
-                params, pt_inputs, deterministic=False,
-                rngs=rng_generator(config.rng_keys()),
-            ).logits
-            pt_loss, pt_accuracy = cross_entropy_loss_and_accuracy(pt_logits, pt_tokens)
-            loss = hf_loss + FLAGS.pt_loss_weight * pt_loss
-            aux = {
-                'hf_accuracy': hf_accuracy,
-                'pt_accuracy': pt_accuracy,
-                'hf_loss': hf_loss,
-                'pt_loss': pt_loss,
-            }
-            return loss, aux
-        grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
-        (loss, aux), grads = grad_fn(train_state.params)
+            return cross_entropy_loss_and_accuracy(logits, tokens, loss_masks)
+        grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True, argnums=0)
+        (hf_loss, hf_accuracy), hf_grads = grad_fn(train_state.params, hf_batch)
+        (pt_loss, pt_accuracy), pt_grads = grad_fn(train_state.params, pt_batch)
+        grads = jax.tree_map(
+            lambda hf_grad, pt_grad: hf_grad + pt_grad * FLAGS.pt_loss_weight,
+            hf_grads, pt_grads,
+        )
         train_state = train_state.apply_gradients(grads=grads)
         metrics = dict(
-            loss=loss,
+            hf_loss=hf_loss,
+            pt_loss=pt_loss,
+            hf_accuracy=hf_accuracy,
+            pt_accuracy=pt_accuracy,
             learning_rate=optimizer_info['learning_rate_schedule'](train_state.step),
             gradient_norm=global_norm(grads),
             param_norm=global_norm(train_state.params),
         )
-        metrics.update(aux)
         return train_state, rng_generator(), metrics
+
+    def eval_step(train_state, rng, hf_batch, pt_batch):
+        rng_generator = JaxRNG(rng)
+        def loss_and_accuracy(params, batch):
+            tokens = with_sharding_constraint(batch['tokens'], PS('dp'))
+            loss_masks = with_sharding_constraint(batch['loss_masks'], PS('dp'))
+            bos_tokens = jnp.full(
+                (tokens.shape[0], 1), config.bos_token_id, dtype=jnp.int32
+            )
+            inputs = jnp.concatenate([bos_tokens, tokens[:, :-1]], axis=1)
+            logits = model.apply(
+                params, inputs, deterministic=False,
+                rngs=rng_generator(config.rng_keys()),
+            ).logits
+            return cross_entropy_loss_and_accuracy(logits, tokens, loss_masks)
+        hf_loss, hf_accuracy = loss_and_accuracy(train_state.params, hf_batch)
+        pt_loss, pt_accuracy = loss_and_accuracy(train_state.params, pt_batch)
+        aux = {
+            'hf_accuracy': hf_accuracy,
+            'pt_accuracy': pt_accuracy,
+            'hf_loss': hf_loss,
+            'pt_loss': pt_loss,
+        }
+        aux = {f'eval_{k}': v for k, v in aux.items()}
+        return rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
         GPTJConfig.get_partition_rules(), train_state_shapes
     )
 
-    sharding_helper = ShardingHelper(train_state_partition)
+    shard_fns, gather_fns = make_shard_and_gather_fns(
+        train_state_partition, train_state_shapes
+    )
     checkpointer = StreamingCheckpointer(
-        logger.checkpoint_dir, enable=jax.process_index() == 0
+        logger.checkpoint_dir, enable=jax.process_index() == 0,
+        save_optimizer_state=FLAGS.save_optimizer_state
     )
 
     sharded_init_fn = pjit(
         init_fn,
         in_axis_resources=PS(),
         out_axis_resources=train_state_partition
+    )
+
+    sharded_create_trainstate_from_params = pjit(
+        create_trainstate_from_params,
+        in_axis_resources=(train_state_partition.params, ),
+        out_axis_resources=train_state_partition,
+        donate_argnums=(0, ),
     )
 
     sharded_train_step = pjit(
@@ -197,51 +243,52 @@ def main(argv):
         donate_argnums=(0, 1),
     )
 
-    def save_checkpoint(train_state):
-        train_state = sharding_helper.get(train_state)
-        step = int(train_state.step)
+    sharded_eval_step = pjit(
+        eval_step,
+        in_axis_resources=(train_state_partition, PS(), PS(), PS()),
+        out_axis_resources=(PS(), PS()),
+        donate_argnums=(1,),
+    )
+
+    def save_checkpoint(train_state, milestone=False):
+        step = int(jax.device_get(train_state.step))
         metadata = dict(
             step=step,
             variant=variant,
             flags=flags_config_dict,
-            config=config.to_dict(),
+            gptj_config=gptj_config.to_dict(),
         )
-        checkpointer.save_pickle(metadata, 'metadata.pkl')
-        checkpointer.save_pickle(hf_dataset, 'hf_dataset.pkl')
-        checkpointer.save_pickle(pt_dataset, 'pt_dataset.pkl')
-        checkpointer.save_checkpoint(train_state, 'train_state')
-
-    start_step = 0
-    restored_checkpoint_state = None
-    restored_params = None
-    if FLAGS.load_checkpoint != '':
-        load_type, load_path = FLAGS.load_checkpoint.split('::', 1)
-        with jax.default_device(jax.devices("cpu")[0]):
-            if load_type == 'trainstate':
-                restored_checkpoint_state = checkpointer.load_checkpoint(
-                    load_path, train_state_shapes
-                )
-                start_step = restored_checkpoint_state.step
-            elif load_type == 'trainstate_params':
-                restored_params = flax.core.frozen_dict.freeze(
-                    checkpointer.load_checkpoint(load_path)['params']
-                )
-            elif load_type == 'huggingface':
-                restored_params = config.load_pretrained(load_path)
+        checkpointer.save_all(
+            train_state=train_state,
+            gather_fns=gather_fns,
+            metadata=metadata,
+            milestone=milestone,
+        )
 
     mesh = get_jax_mp_mesh(FLAGS.mp_mesh_dim)
     with mesh:
-        if restored_checkpoint_state is not None:
-            train_state = sharding_helper.put(restored_checkpoint_state)
-            del restored_checkpoint_state
-        elif restored_params is not None:
+        train_state, restored_params = None, None
+        if FLAGS.load_checkpoint != '':
+            load_type, load_path = FLAGS.load_checkpoint.split('::', 1)
+            if load_type == 'huggingface':
+                restored_params = tree_apply(
+                    shard_fns.params, gptj_config.load_pretrained(load_path)
+                )
+                train_state = None
+            else:
+                train_state, restored_params = checkpointer.load_trainstate_checkpoint(
+                    FLAGS.load_checkpoint, train_state_shapes, shard_fns
+                )
+
+        if train_state is None and restored_params is None:
+            # Initialize from scratch
             train_state = sharded_init_fn(next_rng())
-            train_state = sharding_helper.get(train_state)
-            train_state = train_state.replace(params=restored_params)
-            train_state = sharding_helper.put(train_state)
+        elif train_state is None and restored_params is not None:
+            # Restore from params but initialize train_state
+            train_state = sharded_create_trainstate_from_params(restored_params)
             del restored_params
-        else:
-            train_state = sharded_init_fn(next_rng())
+
+        start_step = int(jax.device_get(train_state.step))
 
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
@@ -256,12 +303,23 @@ def main(argv):
             )
 
             if step % FLAGS.log_freq == 0:
+                if FLAGS.eval_steps > 0:
+                    eval_metric_list = []
+                    for _ in range(FLAGS.eval_steps):
+                        sharded_rng, eval_metrics = sharded_eval_step(
+                            train_state, sharded_rng, next(hf_eval_iterator), next(pt_eval_iterator),
+                        )
+                        eval_metric_list.append(eval_metrics)
+                    metrics.update(average_metrics(eval_metric_list))
+
                 log_metrics = {"step": step}
                 log_metrics.update(metrics)
                 logger.log(log_metrics)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
 
-            if FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
+            if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
+                save_checkpoint(train_state, milestone=True)
+            elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
                 save_checkpoint(train_state)
 
         if FLAGS.save_model_freq > 0:
@@ -269,4 +327,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    absl.app.run(main)
+    utils.run(main)

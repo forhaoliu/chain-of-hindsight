@@ -2,9 +2,13 @@
 
 Authors' implementation of Chain-of-Hindsight which is proposed in [Chain of Hindsight aligns Language Models with Feedback](https://arxiv.org/abs/2302.02676) in Jax.
 
-This implementation allows GPT model training and inference at both small (few TPUs/GPUs) and large (hundreds/thousands of TPUs/GPUs) scales through the use of data and model parallelism.
+This implementation allows GPT model training at both small and large scales through the use of data and model parallelism.
 
-*We are currently working on an improved version of CoH, which comes better extensibility and results, stay tuned.*
+*New in this release:*
+- Added better support for feedback data
+- Pre-generate feedback data for training to simplify the data pipeline
+- Simplified data templates and retain similar performance
+- Added better support for GPT-J and OPT models (including pretraining and finetuning)
 
 # Codebase structure
 
@@ -12,21 +16,21 @@ This implementation allows GPT model training and inference at both small (few T
 .
 ├── coh
 │   ├── data
-│   │   ├── hf_data.py # data loader for human feedback datasets
-│   │   ├── pt_data.py # data loader for pretraining datasets
-│   │   ├── templates.py # templates for generating chain of hindsight
+│   │   ├── dataset.py # data loader for human feedback datasets and geneic pretraining datasets
+│   │   ├── pack_hf.py # scripts for generating chain of hindsight data
 │   ├── coh_train.py # main training script
 │   ├── models
 │   │   ├── gptj
-│   │   │   ├── gptj.py # GPT-J model
+│   │   │   ├── gptj_model.py # GPT-J model
 │   │   │   ├── gptj_train.py # GPT-J training script
+│   │   │   ├── gptj_serve.py # GPT-J serving script
 │   │   ├── opt
-│   │   │   ├── opt.py # OPT model
+│   │   │   ├── opt_model.py # OPT model
 │   │   │   ├── opt_train.py # OPT training script
+│   │   │   ├── opt_serve.py # OPT serving script
 │   ├── scripts
-│   │   ├── lm_eval.py # evaluation script
-│   │   ├── lm_serve.py # serving script
-│   │   ├── serving.py # serving helper functions
+│   │   ├── lm_eval_json.py # evaluation script
+│   │   ├── lm_eval_harness.py # evaluation script for lm-eval-harness
 │   ├── utils.py # helper functions
 │   ├── jax_utils.py # jax helper functions
 ├── scripts
@@ -60,60 +64,118 @@ The tpu_util.sh is a useful script used to start a TPU VM and install dependenci
 # Usage
 
 
-## I want to train CoH
+**Run CoH training**
 
+Prepare the feedback data for training. The data should be in the format of `jsonl` files.
+The script `pack_hf.py` can be used to generate the data for training. It takes the raw feedback data and generates the chain of hindsight data.
+An example that generates the data for training on GPT-J is as follows:
 ```shell
-python3 -m coh.coh_train \
-    --mp_mesh_dim=16 \
-    --load_opt_config='huggingface::EleutherAI/gpt-j-6B' \
-    --model='gptj' \
-    --pretrain_dataset.split='train' \
-    --pretrain_dataset.path='c4' \
-    --pretrain_dataset.seq_length=1024 \
-    --pretrain_dataset.batch_size=512 \
-    --feedback_dataset.tokenizer='EleutherAI/gpt-j-6B' \
-    --feedback_dataset.split='train' \
-    --feedback_dataset.seq_length=1024 \
-    --feedback_dataset.batch_size=512 \
+python -m coh.data.pack_hf \
+    --output_dir='./local' \
+    --dataset='dialogue,webgpt,summary' \
+    --include_feedback='p,n,pn,np'
+```
+where `include_feedback` is the feedback types to include in the training data. The default is to include all feedback types. You can also include only positive feedback or negative feedback by setting `include_feedback='p'` or `include_feedback='n'`.
+And you can also include auxiliary feedback types by setting `include_feedback='p,n,pn,np,aux'` which will result in a larger dataset that comes with more diverse feedback.
+
+The generated data will be saved in the `output_dir` directory and you will need to specify the path to the data when running the training script.
+
+
+Then, run the training script:
+```shell
+python -m coh.coh_train \
+    --mp_mesh_dim=-1 \
+    --load_opt_config='huggingface::facebook/opt-350m' \
+    --model='opt' \
+    --hf_train_dataset.type='feedback' \
+    --hf_train_dataset.text_processor.fields_from_example='fields' \
+    --hf_train_dataset.hf_dataset.path='/home/hao/research/coh/local/train.jsonl' \
+    --hf_train_dataset.hf_dataset.seq_length=4 \
+    --hf_train_dataset.hf_dataset.batch_size=2 \
+    --pt_train_dataset.type='pretrain' \
+    --pt_train_dataset.text_processor.fields='text' \
+    --pt_train_dataset.pt_dataset.path='c4' \
+    --pt_train_dataset.pt_dataset.split='train' \
+    --pt_train_dataset.pt_dataset.seq_length=4 \
+    --pt_train_dataset.pt_dataset.batch_size=2 \
+    --hf_eval_dataset.type='feedback' \
+    --hf_eval_dataset.text_processor.fields_from_example='fields' \
+    --hf_eval_dataset.hf_dataset.path='/home/hao/research/coh/local/test.jsonl' \
+    --hf_eval_dataset.hf_dataset.seq_length=4 \
+    --hf_eval_dataset.hf_dataset.batch_size=2 \
+    --pt_eval_dataset.type='pretrain' \
+    --pt_eval_dataset.text_processor.fields='text' \
+    --pt_eval_dataset.pt_dataset.path='c4' \
+    --pt_eval_dataset.pt_dataset.split='validation' \
+    --pt_eval_dataset.pt_dataset.seq_length=4 \
+    --pt_eval_dataset.pt_dataset.batch_size=2 \
     --log_all_worker=False \
     --logger.online=False \
     --logger.project_id="" \
     --logger.experiment_id="" \
     --logger.experiment_note="" \
     --logger.gcs_output_dir="" \
-    --logger.output_dir="$HOME/coh_output"
+    --logger.output_dir="/home/hao/experiment_output/coh_output"
 ```
+Remeber to change the `hf_train_dataset.hf_dataset.path` and `hf_eval_dataset.hf_dataset.path` to your own path.
+Please change the seq_length and batch_size according to your own GPU memory. The default one is using 1024 sequence length and 256 batch size.
 
-This will finetune a 6B model GPT-J on human feedback datasets.
-You can choose model from GPT-J and OPT models to finetune, it loads pretrained models from HuggingFace. The default setting is to finetune on GPT-J.
+You can switch between GPT-J and OPT by changing the `model` argument.
+Loading pretrained model can be done by using the `load_gptj_config` and `load_checkpoint` arguments. It will load the pretrained model from the specified path, e.g., if you use `load_gptj_config='huggingface::EleutherAI/gpt-j-6B'`, it will load the pretrained model from HuggingFace.
 
-## I want to train SFT
+**Run SFT training**
 
-Just disable the usage of chain of hindsight, then it will finetune on the positive or negative feedback datasets without using chain of hindsight, i.e., the length is fixed to one.
-You probably want to exclude negative feedback datasets from the training set, otherwise the model will be biased towards negative feedback.
+Standard SFT can be done by filtering the feedback data and then training the model on the filtered positive data. This is not currently supported in this codebase yet, but will be added soon. Here we provide a powerful variant of SFT based on CoH that additional conditions on the positive feedback.
 
-## I want to train RLHF
-
-Not being supported in this codebase, an implementation (in PyTorch) is available at [trlx](https://github.com/CarperAI/trlx)
-
-
-## I want to do evaluation
+The script `pack_hf.py` can be used to generate the data for training. It takes the raw feedback data and generates the chain of hindsight data.
 
 ```shell
-python -m coh.scripts.lm_serve \
+python -m coh.data.pack_hf \
+    --output_dir='./local' \
+    --dataset='dialogue,webgpt,summary' \
+    --include_feedback='p'
+```
+where we specify `include_feedback='p'` to only include positive feedback.
+
+The training follows the same procedure as CoH training.
+
+**Run RLHF baseline**
+
+Not being supported in this codebase, an implementation (in PyTorch) is available at [TRLX](https://github.com/CarperAI/trlx)
+
+
+**Run qualtative evaluation**
+
+You can manually check out the quality of finetuned models by running a server of the model:
+For instance, to serve a GPT-J model, run:
+```shell
+python -m coh.models.gptj.gptj_serve \
     --load_gptj_config='Your checkpoint path' \
     --load_checkpoint='Your checkpoint path' \
+    --mp_mesh_dim=-1 \
     --dtype='bf16' \
-    --input_length=512 \
+    --input_length=1024 \
     --seq_length=2048 \
-    --lm_server.host='127.0.0.1' \
-    --lm_server.pre_compile='loglikelihood' \
-    --lm_server.batch_size=2
+    --do_sample=True \
+    --temperature=1.0 \
+    --lm_server.port=5007 \
+    --lm_server.pre_compile='all' \
+    --lm_server.chat_prepend_text='' \
+    --lm_server.chat_lm_prefix='An helpful answer:' \
+    --lm_server.chat_lm_suffix='</s>' \
+    --lm_server.chat_user_prefix='User: ' \
+    --lm_server.chat_user_suffix=' '
 ```
+A chat interface will be served at `127.0.0.1:5007` and you can interact with the model by typing in the prompt.
 
-The compiling process may take a while. The compiled model will be served at `127.0.0.1:5007`. Then, you can run the evaluation script:
+This chat interface can also be used for preliminary human evaluation of dialogue and so on. You can also use the same interface to evaluate other models.
+
+
+**Run quantitative evaluation**
+
+Similarly, once you have a server ready, you can run the evaluation script:
 ```shell
-python -m coh.scripts.lm_eval \
+python -m coh.scripts.lm_eval_harness \
     --lm_server_url='http://localhost:5007/' \
     --tasks='wsc,winogrande' \
     --shots=0
@@ -121,25 +183,17 @@ python -m coh.scripts.lm_eval \
 Full list of tasks can be found at [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness).
 
 
-## I want to do human evaluation
+**Human evaluation**
 
 Not being supported in this codebase, please refer to the paper (experiment settings and appendix) for more details of setting up the human evaluation.
 Note to use pairwise comparisons which are more reliable than rating multiple methods at the same time.
 
 
-## I wan to do pretraining / finetuning without human feedback / preference.
+**Pretraining/finetuning without feedback**.
 
-GPT-J
-```shell
-python -m coh.scripts.models.gptj.gptj_train
-```
+Please check out [gptj_train.py](./models/gptj_train.py) and [opt_train.py](./models/opt_train.py) for more details.
 
-OPT
-```shell
-python -m coh.scripts.models.opt.opt_train
-```
-
-# Citation
+# Reference
 
 If you use this codebase, please cite the following paper:
 
@@ -156,7 +210,9 @@ If you use this codebase, please cite the following paper:
 # Acknowledgement
 
 This codebase is heavily built on top of [EasyLM](https://github.com/young-geng/EasyLM) using [Jax](https://github.com/google/jax) and [Flax](
-https://github.com/google/flax). The evaluation code is heavily based on EleutherAI [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness). The data loader and pretrained models weights are based on HuggingFace [Datasets](https://github.com/huggingface/datasets) and [Transformers](https://github.com/huggingface/transformers).
+https://github.com/google/flax).
+The evaluation code is heavily based on EleutherAI [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness). The data loader and pretrained models weights are based on HuggingFace [Datasets](https://github.com/huggingface/datasets) and [Transformers](https://github.com/huggingface/transformers).
+
 We thank the authors of these libraries for their great work without which this project would not be possible.
 
 

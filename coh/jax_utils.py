@@ -1,30 +1,27 @@
-import dataclasses
 import os
-import random
-import re
-import time
-from concurrent.futures import ThreadPoolExecutor
+import math
+from typing import Any, Mapping, Text, Tuple, Union, NamedTuple
 from functools import partial
-from typing import Any, Mapping, NamedTuple, Text, Tuple, Union
-from ml_collections import ConfigDict
+import re
+import dataclasses
+import random
 
 import dill
 import flax
 import jax
 import jax.numpy as jnp
-import msgpack
-import numpy as np
-import optax
-from absl import logging
-from flax import jax_utils
-from flax.core import FrozenDict
-from flax.serialization import from_bytes, to_bytes
-from flax.training.train_state import TrainState
 from jax.experimental import PartitionSpec as PS
+from jax.experimental.pjit import with_sharding_constraint as _with_sharding_constraint
 from jax.experimental.maps import Mesh
 from jax.experimental.pjit import pjit
-
-from coh.utils import open_file, save_pickle
+from jax.interpreters import pxla
+import numpy as np
+from absl import logging
+from flax import jax_utils
+from flax.training.train_state import TrainState
+from flax.core import FrozenDict
+import optax
+from transformers import FlaxLogitsWarper
 
 
 class JaxRNG(object):
@@ -53,42 +50,62 @@ class JaxRNG(object):
             return {key: val for key, val in zip(keys, split_rngs[1:])}
 
 
-class ShardingHelper(object):
-    """ A helper utility that handles gathering sharded pytree to host and
-        shard host pytree to devices that supports multi-host environment.
-        This utility does gather and shard one by one to avoid OOM on device.
+class FlaxTemperatureLogitsWarper(FlaxLogitsWarper):
+    """ JIT traceable version of FlaxLogitsWarper that performs temperature scaling."""
+    def __init__(self, temperature):
+        self.temperature = temperature
+
+    def __call__(self, input_ids, scores, cur_len):
+        return scores / jnp.clip(self.temperature, a_min=1e-8)
+
+
+def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
+    """ Create pytree of sharding and gathering functions from pytree of
+        partition specs.
     """
+    float_dtypes = (jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64)
 
-    def __init__(self, partition_specs):
-        self.partition_specs = partition_specs
-        def gather_tensor(partition_spec):
-            return pjit(
-                lambda x: x,
-                in_axis_resources=partition_spec,
-                out_axis_resources=None
-            )
+    def make_to_dtype_fn(dtype_spec):
+        def to_dtype(tensor):
+            if dtype_specs in float_dtypes and getattr(tensor, 'dtype', None) in float_dtypes:
+                # Convert all float tensors to the same dtype
+                return tensor.astype(dtype_specs)
+            elif hasattr(dtype_spec, 'dtype') and hasattr(tensor, 'dtype'):
+                return tensor.astype(dtype_spec.dtype)
+            return tensor
+        return to_dtype
 
-        def shard_tensor(partition_spec):
-            return pjit(
-                lambda x: x,
-                in_axis_resources=None,
-                out_axis_resources=partition_spec
-            )
+    def make_shard_fn(partition_spec, dtype_spec=None):
+        jax_shard_function = pjit(
+            make_to_dtype_fn(dtype_spec),
+            in_axis_resources=None,
+            out_axis_resources=partition_spec
+        )
+        def shard_fn(tensor):
+            return jax_shard_function(tensor).block_until_ready()
+        return shard_fn
 
-        self.gather_fns = jax.tree_util.tree_map(gather_tensor, partition_specs)
-        self.shard_fns = jax.tree_util.tree_map(shard_tensor, partition_specs)
+    def make_gather_fn(partition_spec, dtype_spec=None):
+        jax_gather_fn = pjit(
+            make_to_dtype_fn(dtype_spec),
+            in_axis_resources=partition_spec,
+            out_axis_resources=None
+        )
+        def gather_fn(tensor):
+            return jax.device_get(jax_gather_fn(tensor))
+        return gather_fn
 
-    def get(self, tree):
-        def get_fn(gather_fn, tensor):
-            return jax.device_get(gather_fn(tensor))
-
-        return jax.tree_util.tree_map(get_fn, self.gather_fns, tree)
-
-    def put(self, tree):
-        def put_fn(shard_fn, tensor):
-            return shard_fn(tensor).block_until_ready()
-
-        return jax.tree_util.tree_map(put_fn, self.shard_fns, tree)
+    if dtype_specs is None or dtype_specs in float_dtypes:
+        shard_fns = jax.tree_util.tree_map(make_shard_fn, partition_specs)
+        gather_fns = jax.tree_util.tree_map(make_gather_fn, partition_specs)
+    else:
+        shard_fns = jax.tree_util.tree_map(
+            make_shard_fn, partition_specs, dtype_specs
+        )
+        gather_fns = jax.tree_util.tree_map(
+            make_gather_fn, partition_specs, dtype_specs
+        )
+    return shard_fns, gather_fns
 
 
 def set_random_seed(seed):
@@ -97,13 +114,60 @@ def set_random_seed(seed):
     init_rng(seed)
 
 
-def get_jax_mp_mesh(mp_axis_dim, mp_axis_name='mp', dp_axis_name='dp'):
+def get_jax_mp_mesh(mp_axis_dims, mp_axis_prefix='mp', dp_axis_name='dp'):
     """ Return a 2D mesh for (MP, DP) partitioning. """
-    assert jax.device_count() % mp_axis_dim == 0
-    return Mesh(
-        np.array(jax.devices()).reshape(-1, mp_axis_dim),
-        (dp_axis_name, mp_axis_name)
-    )
+    if isinstance(mp_axis_dims, int):
+        mp_axis_dims = [mp_axis_dims]
+    elif isinstance(mp_axis_dims, str):
+        mp_axis_dims = mp_axis_dims.strip().replace(' ', '')
+        mp_axis_dims = [int(x) for x in mp_axis_dims.split(',')]
+
+    device_count = jax.device_count()
+    mp_axis_dims = [x if x > 0 else device_count for x in mp_axis_dims]
+
+    total_mp_dims = np.prod(mp_axis_dims)
+    assert total_mp_dims <= device_count and device_count % total_mp_dims == 0
+
+    axis_names = [dp_axis_name]
+    if len(mp_axis_dims) == 1:
+        axis_names.append(mp_axis_prefix)
+    else:
+        for i in range(1, len(mp_axis_dims) + 1):
+            axis_names.append(f'{mp_axis_prefix}{i}')
+
+    return Mesh(np.array(jax.devices()).reshape(-1, *mp_axis_dims), axis_names)
+
+
+def names_in_current_mesh(*names):
+    """ Check if current mesh axes contain these names. """
+    mesh_axis_names = pxla.thread_resources.env.physical_mesh.axis_names
+    return set(names) <= set(mesh_axis_names)
+
+
+def get_names_from_parition_spec(partition_specs):
+    """ Return axis names from partition specs. """
+    names = set()
+    if isinstance(partition_specs, dict):
+        partition_specs = partition_specs.values()
+    for item in partition_specs:
+        if item is None:
+            continue
+        elif isinstance(item, str):
+            names.add(item)
+        else:
+            names.update(get_names_from_parition_spec(item))
+
+    return list(names)
+
+
+def with_sharding_constraint(x, partition_specs):
+    """ A smarter version of with_sharding_constraint that only applies the
+        constraint if the current mesh contains the axes in the partition specs.
+    """
+    axis_names = get_names_from_parition_spec(partition_specs)
+    if names_in_current_mesh(*axis_names):
+        x = _with_sharding_constraint(x, partition_specs)
+    return x
 
 
 def wrap_function_with_rng(rng):
@@ -161,7 +225,7 @@ def cross_entropy_loss(logits, labels, smoothing_factor=0.):
     return -jnp.mean(jnp.sum(logp * labels, axis=-1))
 
 
-def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
+def cross_entropy_loss_and_accuracy(logits, tokens, valid=None, batch_stat=False):
     if valid is None:
         valid = jnp.ones(tokens.shape[:2])
     valid = valid.astype(jnp.float32)
@@ -176,14 +240,21 @@ def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
         -1,
     )
     token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
+    batch_loss = -jnp.mean(token_log_prob, axis=0)
     loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
     correct = jnp.where(
-        valid > 0.0,
-        jnp.argmax(logits, axis=-1) == tokens,
-        jnp.array(False)
+        valid > 0.0, jnp.argmax(logits, axis=-1) == tokens, jnp.array(False)
     )
+    batch_accuracy = jnp.mean(correct, axis=0)
     accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
-    return loss, accuracy
+    if batch_stat:
+        stat = {
+            "batch_loss": batch_loss,
+            "batch_accuracy": batch_accuracy,
+        }
+        return loss, accuracy, stat
+    else:
+        return loss, accuracy
 
 
 def global_norm(tree):
@@ -191,6 +262,31 @@ def global_norm(tree):
     squared = jax.tree_util.tree_map(lambda x: jnp.sum(jnp.square(x)), tree)
     flattened, _ = jax.flatten_util.ravel_pytree(squared)
     return jnp.sqrt(jnp.sum(flattened))
+
+
+def average_metrics(metrics):
+    return jax.tree_map(
+        lambda *args: jnp.mean(jnp.stack(args)),
+        *metrics
+    )
+
+
+def get_float_dtype_by_name(dtype):
+    return {
+        'bf16': jnp.bfloat16,
+        'fp16': jnp.float16,
+        'fp32': jnp.float32,
+        'fp64': jnp.float64,
+    }[dtype]
+
+
+def float_to_dtype(tree, dtype):
+    float_dtypes = (jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64)
+    def to_dtype(x):
+        if getattr(x, 'dtype', None) in float_dtypes:
+            x = x.astype(dtype)
+        return x
+    return jax.tree_util.tree_map(to_dtype, tree)
 
 
 def flatten_tree(xs, is_leaf=None, sep=None):
@@ -268,231 +364,22 @@ def match_partition_rules(rules, params):
     return named_tree_map(get_partition_spec, params, sep='/')
 
 
-class StreamingCheckpointer(object):
-    """ Custom msgpack checkpointer that saves large train states by serializing
-        and saving tensors one by one in a streaming fashion. Avoids running
-        out of memory or local TPU disk with default flax checkpointer. The
-        checkpointer saves the train state in an asynchronous manner to avoid
-        timing out on JAX barriers in multi-host training.
+def get_weight_decay_mask(exclusions):
+    """ Return a weight decay mask function that computes the pytree masks
+        according to the given exclusion rules.
     """
+    def decay(name, _):
+        for rule in exclusions:
+            if re.search(rule, name) is not None:
+                return False
+        return True
 
-    def __init__(self, checkpoint_dir, enable=True):
-        self.checkpoint_dir = checkpoint_dir
-        self.enable = enable
-        self.async_manager = ThreadPoolExecutor(max_workers=1)
+    def weight_decay_mask(params):
+        return named_tree_map(decay, params, sep='/')
 
-    def _save_checkpoint_worker(self, train_state, filename):
-        path = os.path.join(self.checkpoint_dir, filename)
-        packer = msgpack.Packer()
-        flattend_train_state = flax.traverse_util.flatten_dict(train_state)
-        with open_file(path, "wb") as fout:
-            for key, value in flattend_train_state.items():
-                fout.write(packer.pack((key, to_bytes(value))))
-
-    def save_checkpoint(self, train_state, filename):
-        train_state = flax.serialization.to_state_dict(train_state)
-        if self.enable:
-            self.async_manager.submit(
-                self._save_checkpoint_worker, train_state, filename
-            )
-
-    @staticmethod
-    def load_checkpoint(path, target=None):
-        flattend_train_state = {}
-        with open_file(path) as fin:
-            unpacker = msgpack.Unpacker(fin, max_buffer_size=0)
-            for key, value in unpacker:
-                flattend_train_state[tuple(key)] = from_bytes(None, value)
-
-        train_state = flax.traverse_util.unflatten_dict(flattend_train_state)
-        if target is None:
-            return train_state
-        return flax.serialization.from_state_dict(target, train_state)
-
-    def _save_pickle_worker(self, obj, filename):
-        path = os.path.join(self.checkpoint_dir, filename)
-        save_pickle(obj, path)
-
-    def save_pickle(self, obj, filename):
-        if self.enable:
-            self.async_manager.submit(self._save_pickle_worker, obj, filename)
+    return weight_decay_mask
 
 
-class OptimizerFactory(object):
-    """ Configurable optax optimizer factory. """
-
-    def __init__(self):
-        raise NotImplementedError
-
-    @staticmethod
-    def get_default_config(updates=None):
-        config = ConfigDict()
-        config.accumulate_gradient_steps = 1
-        config.type = 'palm'
-        config.palm_optimizer = PalmOptimizerFactory.get_default_config()
-        config.adamw_optimizer = AdamWOptimizerFactory.get_default_config()
-
-        if updates is not None:
-            config.update(ConfigDict(updates).copy_and_resolve_references())
-        return config
-
-    @classmethod
-    def get_optimizer(cls, config, weight_decay_mask=None):
-        config = cls.get_default_config(config)
-        if config.type == 'palm':
-            optimizer, optimizer_info = PalmOptimizerFactory.get_optimizer(
-                config.palm_optimizer, weight_decay_mask
-            )
-        elif config.type == 'adamw':
-            optimizer, optimizer_info = AdamWOptimizerFactory.get_optimizer(
-                config.adamw_optimizer, weight_decay_mask
-            )
-        else:
-            raise ValueError(f'Unknown optimizer type: {config.optimizer_type}')
-
-        if config.accumulate_gradient_steps > 1:
-            optimizer = optax.MultiSteps(
-                optimizer, config.accumulate_gradient_steps
-            )
-
-        return optimizer, optimizer_info
-
-
-class PalmOptimizerFactory(object):
-    """ PaLM optimizer factory. This optimizer implements the optimizer
-        described in the PaLM paper: https://arxiv.org/abs/2204.02311
-    """
-
-    def __init__(self):
-        raise NotImplementedError
-
-    @staticmethod
-    def get_default_config(updates=None):
-        config = ConfigDict()
-        config.lr = 0.01
-        config.lr_warmup_steps = 10000
-        config.b1 = 0.9
-        config.b2 = 0.99
-        config.clip_gradient = 1.0
-        config.weight_decay = 1e-4
-        config.bf16_momentum = True
-
-        if updates is not None:
-            config.update(ConfigDict(updates).copy_and_resolve_references())
-        return config
-
-    @classmethod
-    def get_optimizer(cls, config, weight_decay_mask=None):
-        config = cls.get_default_config(config)
-
-        def learning_rate_schedule(step):
-            multiplier = config.lr / 0.01
-            return multiplier / jnp.sqrt(jnp.maximum(step, config.lr_warmup_steps))
-
-        def weight_decay_schedule(step):
-            multiplier = config.weight_decay / 1e-4
-            return -multiplier * jnp.square(learning_rate_schedule(step))
-
-        optimizer_info = dict(
-            learning_rate_schedule=learning_rate_schedule,
-            weight_decay_schedule=weight_decay_schedule,
-        )
-
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(config.clip_gradient),
-            optax.adafactor(
-                learning_rate=learning_rate_schedule,
-                multiply_by_parameter_scale=True,
-                momentum=config.b1,
-                decay_rate=config.b2,
-                factored=False,
-                clipping_threshold=None,
-                dtype_momentum=jnp.bfloat16 if config.bf16_momentum else jnp.float32,
-            ),
-            optax_add_scheduled_weight_decay(
-                weight_decay_schedule, weight_decay_mask
-            )
-        )
-        return optimizer, optimizer_info
-
-
-class OptaxScheduledWeightDecayState(NamedTuple):
-    count: jnp.DeviceArray
-
-
-def optax_add_scheduled_weight_decay(schedule_fn, mask=None):
-    """ Apply weight decay with schedule. """
-
-    def init_fn(params):
-        del params
-        return OptaxScheduledWeightDecayState(count=jnp.zeros([], jnp.int32))
-
-    def update_fn(updates, state, params):
-        if params is None:
-            raise ValueError('Params cannot be None for weight decay!')
-
-        weight_decay = schedule_fn(state.count)
-        updates = jax.tree_util.tree_map(
-            lambda g, p: g + weight_decay * p, updates, params
-        )
-        return updates, OptaxScheduledWeightDecayState(
-            count=optax.safe_int32_increment(state.count)
-        )
-
-    if mask is not None:
-        return optax.masked(optax.GradientTransformation(init_fn, update_fn), mask)
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-class AdamWOptimizerFactory(object):
-    """ AdamW optimizer with cosine schedule. """
-
-    def __init__(self):
-        raise NotImplementedError
-
-    @staticmethod
-    def get_default_config(updates=None):
-        config = ConfigDict()
-        config.init_lr = 0.0
-        config.end_lr = 0.0
-        config.lr = 0.01
-        config.lr_warmup_steps = 10000
-        config.lr_decay_steps = 500000
-        config.b1 = 0.9
-        config.b2 = 0.99
-        config.clip_gradient = 1.0
-        config.weight_decay = 1e-4
-        config.bf16_momentum = True
-
-        if updates is not None:
-            config.update(ConfigDict(updates).copy_and_resolve_references())
-        return config
-
-    @classmethod
-    def get_optimizer(cls, config, weight_decay_mask=None):
-        config = cls.get_default_config(config)
-
-        learning_rate_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=config.init_lr,
-            peak_value=config.lr,
-            warmup_steps=config.lr_warmup_steps,
-            decay_steps=config.lr_decay_steps,
-            end_value=config.end_lr,
-        )
-
-        optimizer_info = dict(
-            learning_rate_schedule=learning_rate_schedule,
-        )
-
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(config.clip_gradient),
-            optax.adamw(
-                learning_rate=learning_rate_schedule,
-                weight_decay=config.weight_decay,
-                b1=0.9,
-                b2=0.95,
-                mask=weight_decay_mask,
-                mu_dtype=jnp.bfloat16 if config.bf16_momentum else jnp.float32,
-            ),
-        )
-        return optimizer, optimizer_info
+def tree_apply(fns, tree):
+    """ Apply a pytree of functions to the pytree. """
+    return jax.tree_util.tree_map(lambda fn, x: fn(x), fns, tree)
