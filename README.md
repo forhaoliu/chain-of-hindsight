@@ -33,14 +33,14 @@ This implementation allows GPT model training at both small and large scales thr
 │   │   ├── lm_eval_harness.py # evaluation script for lm-eval-harness
 │   ├── utils.py # helper functions
 │   ├── jax_utils.py # jax helper functions
+│   ├── checkpoint.py # checkpoint functions
+│   ├── coh_train.py # main training script
+│   ├── optimizers.py # optimizer functions
+│   ├── serving.py # serving functions
 ├── scripts
 │   └── gpu_enviroment.yml  # conda environment for GPU hosts
 │   └── tpu_vm_setup.sh  # script for installing dependencies on TPU hosts
 │   └── tpu_util.sh  # script for starting/stopping TPU VMs
-├── scripts  # scripts for evaluation
-│    dataset_builders  # scripts used to generate some of the datasets
-├── resources  # small, git-tracked files from which lists of words or prompts are loaded
-└── train.py  # the main training script
 ```
 
 # Installation
@@ -123,9 +123,22 @@ Please change the seq_length and batch_size according to your own GPU memory. Th
 You can switch between GPT-J and OPT by changing the `model` argument.
 Loading pretrained model can be done by using the `load_gptj_config` and `load_checkpoint` arguments. It will load the pretrained model from the specified path, e.g., if you use `load_gptj_config='huggingface::EleutherAI/gpt-j-6B'`, it will load the pretrained model from HuggingFace.
 
+As for CoH variant that conditions on feedback as input but not predicting sequence of outputs.
+The script `pack_hf.py` can be used to generate the data for training. It takes the raw feedback data and generates the chain of hindsight data.
+
+```shell
+python -m coh.data.pack_hf \
+    --output_dir='./local' \
+    --dataset='dialogue,webgpt,summary' \
+    --include_feedback='p,n'
+```
+where we specify `include_feedback='p,n'` to only include positive and negative feedback, but not interleave feedback.
+
+The training follows the same procedure as CoH training.
+
 **Run SFT training**
 
-Standard SFT can be done by filtering the feedback data and then training the model on the filtered positive data. This is not currently supported in this codebase yet, but will be added soon. Here we provide a powerful variant of SFT based on CoH that additional conditions on the positive feedback.
+Standard SFT can be done by filtering the feedback data and then training the model on the filtered positive data. This is not currently supported in this codebase yet, but will be added soon. Here we provide a variant of SFT based on CoH. In addition to standard SFT that trains only on positive data, it takes into account the positive feedback as an input.
 
 The script `pack_hf.py` can be used to generate the data for training. It takes the raw feedback data and generates the chain of hindsight data.
 
@@ -191,7 +204,8 @@ Note to use pairwise comparisons which are more reliable than rating multiple me
 
 **Pretraining/finetuning without feedback**.
 
-Please check out [gptj_train.py](./models/gptj_train.py) and [opt_train.py](./models/opt_train.py) for more details.
+Please check out [gptj_train.py](./models/gptj/gptj_train.py) and [opt_train.py](./models/opt/opt_train.py) for the training scripts.
+You can also use the same scripts to finetune the model on other datasets.
 
 # Reference
 
