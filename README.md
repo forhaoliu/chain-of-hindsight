@@ -52,7 +52,7 @@ export PYTHONPATH="${PWD}:$PYTHONPATH"
 ```
 To install GPU dependencies, run:
 ```shell
-conda env create -f scripts/gpu_enviroment.yml
+conda env create -f scripts/gpu_environment.yml
 ```
 
 To install TPU dependencies, run the following command on every TPU host:
