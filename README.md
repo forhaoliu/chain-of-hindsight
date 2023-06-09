@@ -1,6 +1,10 @@
-# CoH's Implementation
+# Chain of Hindsight aligns Language Models with Feedback
 
-Authors' implementation of Chain-of-Hindsight which is proposed in [Chain of Hindsight aligns Language Models with Feedback](https://arxiv.org/abs/2302.02676) in Jax.
+Hao Liu, Carmelo Sferrazza, Pieter Abbeel
+
+Paper: https://arxiv.org/abs/2302.02676
+
+Jax implementation of the Chain-of-Hindsight idea proposed in [Chain of Hindsight aligns Language Models with Feedback](https://arxiv.org/abs/2302.02676).
 
 This implementation allows GPT model training at both small and large scales through the use of data and model parallelism.
 
@@ -209,7 +213,7 @@ You can also use the same scripts to finetune the model on other datasets.
 
 # Reference
 
-If you use this codebase, please cite the following paper:
+If you find our work relevant to your research, please cite:
 
 ```bibtex
 @article{liu2023languages,
@@ -219,16 +223,3 @@ If you use this codebase, please cite the following paper:
   year={2023}
 }
 ```
-
-
-# Acknowledgement
-
-This codebase is heavily built on top of [EasyLM](https://github.com/young-geng/EasyLM) using [Jax](https://github.com/google/jax) and [Flax](
-https://github.com/google/flax).
-The evaluation code is heavily based on EleutherAI [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness). The data loader and pretrained models weights are based on HuggingFace [Datasets](https://github.com/huggingface/datasets) and [Transformers](https://github.com/huggingface/transformers).
-
-We thank the authors of these libraries for their great work without which this project would not be possible.
-
-
-# Contact
-If you have any questions, please contact hao.liu@cs.berkeley.edu.
