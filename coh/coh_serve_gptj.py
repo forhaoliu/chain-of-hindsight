@@ -1,42 +1,30 @@
-import dataclasses
 import pprint
 from functools import partial
-import re
-import os
-from threading import Lock
 
-
-from tqdm import tqdm, trange
 import numpy as np
-import coh.utils as utils
+import coh.tools.utils as utils
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.pjit import pjit, with_sharding_constraint
-from jax.experimental import PartitionSpec as PS
-import flax
-from flax import linen as nn
-from flax.jax_utils import prefetch_to_device
-from flax.training.train_state import TrainState
+from jax.experimental.pjit import pjit
+from jax.sharding import PartitionSpec as PS
 import optax
 from transformers import GenerationConfig, FlaxLogitsProcessorList
 
-from coh.checkpoint import StreamingCheckpointer
-from coh.serving import LMServer
-from coh.jax_utils import (
-    JaxRNG, get_jax_mp_mesh, next_rng, match_partition_rules, tree_apply,
+from coh.tools.checkpoint import StreamingCheckpointer
+from coh.tools.serving import LMServer
+from coh.tools.jax_utils import (
+    JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules, tree_apply,
     set_random_seed, get_float_dtype_by_name, make_shard_and_gather_fns,
-    FlaxTemperatureLogitsWarper
+    with_sharding_constraint, FlaxTemperatureLogitsWarper
 )
-from coh.models.gptj.gptj_model import (
-    GPTJConfig, FlaxGPTJForCausalLMModule, FlaxGPTJForCausalLM
-)
+from coh.gptj import GPTJConfig, FlaxGPTJForCausalLM
 
 
 FLAGS, FLAGS_DEF = utils.define_flags_with_default(
     seed=42,
     initialize_jax_distributed=False,
-    mp_mesh_dim=1,
+    mesh_dim='1,-1,1',
     dtype='bf16',
     input_length=1024,
     seq_length=2048,
@@ -44,17 +32,17 @@ FLAGS, FLAGS_DEF = utils.define_flags_with_default(
     top_p=1.0,
     do_sample=True,
     num_beams=1,
-    loglikelihood_add_bos_token=False,
+    add_bos_token=True,
     load_gptj_config='',
     load_checkpoint='',
     tokenizer=GPTJConfig.get_tokenizer_config(),
     lm_server=LMServer.get_default_config(),
+    jax_distributed=JaxDistributedConfig.get_default_config(),
 )
 
 
 def main(argv):
-    if FLAGS.initialize_jax_distributed:
-        jax.distributed.initialize()
+    JaxDistributedConfig.initialize(FLAGS.jax_distributed)
     set_random_seed(FLAGS.seed)
 
     prefix_tokenizer = GPTJConfig.get_tokenizer(
@@ -66,14 +54,9 @@ def main(argv):
 
     with jax.default_device(jax.devices("cpu")[0]):
         gptj_config = GPTJConfig.load_config(FLAGS.load_gptj_config)
-        load_type, load_path = FLAGS.load_checkpoint.split('::', 1)
-        if load_type == 'huggingface':
-            params = gptj_config.load_pretrained(load_path)
-        else:
-            assert load_type != 'trainstate'
-            _, params = StreamingCheckpointer.load_trainstate_checkpoint(
-                FLAGS.load_checkpoint
-            )
+        _, params = StreamingCheckpointer.load_trainstate_checkpoint(
+            FLAGS.load_checkpoint, disallow_trainstate=True
+        )
 
         hf_model = FlaxGPTJForCausalLM(
             gptj_config,
@@ -91,11 +74,11 @@ def main(argv):
 
     @partial(
         pjit,
-        in_axis_resources=(model_ps, PS(), PS()),
-        out_axis_resources=(PS(), PS(), PS())
+        in_shardings=(model_ps, PS(), PS()),
+        out_shardings=(PS(), PS(), PS())
     )
     def forward_loglikelihood(params, rng, batch):
-        batch = with_sharding_constraint(batch, PS('dp'))
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         rng_generator = JaxRNG(rng)
         input_tokens = batch['input_tokens']
         output_tokens = batch['output_tokens']
@@ -106,8 +89,8 @@ def main(argv):
             params, input_tokens, attention_mask=input_mask,
             deterministic=True, rngs=rng_generator(gptj_config.rng_keys()),
         ).logits
-        if gptj_config.n_real_tokens is not None:
-          logits = logits.at[:, :, gptj_config.n_real_tokens:].set(-1e8)
+        # if gptj_config.n_real_tokens is not None:
+        #   logits = logits.at[:, :, gptj_config.n_real_tokens:].set(-1e8)
         loglikelihood = -optax.softmax_cross_entropy_with_integer_labels(
             logits, output_tokens
         )
@@ -123,11 +106,11 @@ def main(argv):
 
     @partial(
         pjit,
-        in_axis_resources=(model_ps, PS(), PS(), PS()),
-        out_axis_resources=(PS(), PS())
+        in_shardings=(model_ps, PS(), PS(), PS()),
+        out_shardings=(PS(), PS())
     )
     def forward_generate(params, rng, batch, temperature):
-        batch = with_sharding_constraint(batch, PS('dp'))
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         rng_generator = JaxRNG(rng)
         output = hf_model.generate(
             batch['input_tokens'],
@@ -152,11 +135,11 @@ def main(argv):
 
     @partial(
         pjit,
-        in_axis_resources=(model_ps, PS(), PS()),
-        out_axis_resources=(PS(), PS())
+        in_shardings=(model_ps, PS(), PS()),
+        out_shardings=(PS(), PS())
     )
     def forward_greedy_generate(params, rng, batch):
-        batch = with_sharding_constraint(batch, PS('dp'))
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         rng_generator = JaxRNG(rng)
         output = hf_model.generate(
             batch['input_tokens'],
@@ -174,12 +157,12 @@ def main(argv):
         ).sequences[:, batch['input_tokens'].shape[1]:]
         return output, rng_generator()
 
-    mesh = get_jax_mp_mesh(FLAGS.mp_mesh_dim)
+    mesh = GPTJConfig.get_jax_mesh(FLAGS.mesh_dim)
     with mesh:
         params = tree_apply(shard_fns, params)
         sharded_rng = next_rng()
 
-    class GPTJServer(LMServer):
+    class ModelServer(LMServer):
 
         @staticmethod
         def loglikelihood(prefix_text, text):
@@ -206,7 +189,7 @@ def main(argv):
             input_mask = np.concatenate(
                 [prefix.attention_mask, inputs.attention_mask], axis=1
             )
-            if FLAGS.loglikelihood_add_bos_token:
+            if FLAGS.add_bos_token:
                 bos_mask = np.ones_like(input_mask[:, :1])
             else:
                 bos_mask = np.zeros_like(input_mask[:, :1])
@@ -306,9 +289,14 @@ def main(argv):
                 max_length=FLAGS.input_length,
                 return_tensors='np',
             )
+            input_tokens = inputs.input_ids
+            input_mask = inputs.attention_mask
+            if FLAGS.add_bos_token:
+                input_tokens[:, 0] = tokenizer.bos_token_id
+                input_mask[:, 0] = 1
             batch = dict(
-                input_tokens=inputs.input_ids,
-                attention_mask=inputs.attention_mask,
+                input_tokens=input_tokens,
+                attention_mask=input_mask,
             )
             with mesh:
                 output, sharded_rng = forward_generate(
@@ -360,6 +348,10 @@ def main(argv):
                         input_tokens = input_tokens[:, -FLAGS.input_length:]
                         attention_mask = attention_mask[:, -FLAGS.input_length:]
 
+                    if FLAGS.add_bos_token:
+                        input_tokens[:, 0] = tokenizer.bos_token_id
+                        attention_mask[:, 0] = 1
+
                     batch = dict(input_tokens=input_tokens, attention_mask=attention_mask)
 
                     with mesh:
@@ -386,7 +378,7 @@ def main(argv):
             return all_outputs
 
 
-    server = GPTJServer(FLAGS.lm_server)
+    server = ModelServer(FLAGS.lm_server)
     server.run()
 
 

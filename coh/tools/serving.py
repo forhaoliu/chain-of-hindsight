@@ -6,7 +6,7 @@ import os
 from threading import Lock
 import urllib
 import time
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from pydantic import BaseModel
 import absl.logging
@@ -23,7 +23,7 @@ from requests.exceptions import Timeout, ConnectionError
 class InferenceRequest(BaseModel):
     prefix_text: Optional[List[str]] = None
     text: Optional[List[str]] = None
-    until: Optional[List[str]] = None
+    until: Optional[Union[List[str], List[List[str]]]] = None
     temperature: Optional[float] = None
 
 
@@ -39,7 +39,6 @@ class LMServer(object):
     @staticmethod
     def get_default_config(updates=None):
         config = ConfigDict()
-        config.name = 'lm_server'
         config.host = '0.0.0.0'
         config.port = 5007
         config.batch_size = 1
@@ -301,8 +300,8 @@ class LMServer(object):
         }
 
     def create_chat_app(self):
-        with gr.Blocks(analytics_enabled=False, title='CUBE Chat') as gradio_chatbot:
-            gr.Markdown('# CUBE demo')
+        with gr.Blocks(analytics_enabled=False, title='Evaluation') as gradio_chatbot:
+            gr.Markdown('Evaluation Interface')
             gr.Markdown(self.config.notes)
             chatbot = gr.Chatbot(label='Chat history')
             msg = gr.Textbox(
@@ -311,6 +310,7 @@ class LMServer(object):
             )
             with gr.Row():
                 send = gr.Button('Send')
+                regenerate = gr.Button('Regenerate', interactive=False)
                 clear = gr.Button('Reset')
 
             temp_slider = gr.Slider(
@@ -318,61 +318,84 @@ class LMServer(object):
                 value=self.config.default_temperature
             )
 
-            context_state = gr.State('')
+            context_state = gr.State(['', ''])
 
-            def user_fn(user_message, history):
+            def user_fn(user_message, history, context):
                 return {
                     msg: gr.update(value='', interactive=False),
                     clear: gr.update(interactive=False),
                     send: gr.update(interactive=False),
+                    regenerate: gr.update(interactive=False),
                     chatbot: history + [[user_message, None]],
+                    context_state: [context[1], context[1]],
                 }
 
             def model_fn(history, context, temperature):
-                history[-1][1], context = self.process_chat(
-                    history[-1][0], context, temperature
+                history[-1][1], new_context = self.process_chat(
+                    history[-1][0], context[0], temperature
                 )
                 return {
                     msg: gr.update(value='', interactive=True),
                     clear: gr.update(interactive=True),
                     send: gr.update(interactive=True),
                     chatbot: history,
-                    context_state: context,
+                    context_state: [context[0], new_context],
+                    regenerate: gr.update(interactive=True),
+                }
+
+            def regenerate_fn():
+                return {
+                    msg: gr.update(value='', interactive=False),
+                    clear: gr.update(interactive=False),
+                    send: gr.update(interactive=False),
+                    regenerate: gr.update(interactive=False),
                 }
 
             def clear_fn():
                 return {
                     chatbot: None,
                     msg: '',
-                    context_state: '',
+                    context_state: ['', ''],
+                    regenerate: gr.update(interactive=False),
                 }
 
             msg.submit(
                 user_fn,
-                inputs=[msg, chatbot],
-                outputs=[msg, clear, send, chatbot],
+                inputs=[msg, chatbot, context_state],
+                outputs=[msg, clear, send, chatbot, context_state, regenerate],
                 queue=False
             ).then(
                 model_fn,
                 inputs=[chatbot, context_state, temp_slider],
-                outputs=[msg, clear, send, chatbot, context_state],
+                outputs=[msg, clear, send, chatbot, context_state, regenerate],
                 queue=True
             )
             send.click(
                 user_fn,
-                inputs=[msg, chatbot],
-                outputs=[msg, clear, send, chatbot],
+                inputs=[msg, chatbot, context_state],
+                outputs=[msg, clear, send, chatbot, context_state, regenerate],
                 queue=False
             ).then(
                 model_fn,
                 inputs=[chatbot, context_state, temp_slider],
-                outputs=[msg, clear, send, chatbot, context_state],
+                outputs=[msg, clear, send, chatbot, context_state, regenerate],
+                queue=True
+            )
+            regenerate.click(
+                regenerate_fn,
+                inputs=None,
+                outputs=[msg, clear, send, regenerate],
+                queue=False
+            ).then(
+                model_fn,
+                inputs=[chatbot, context_state, temp_slider],
+                outputs=[msg, clear, send, chatbot, context_state, regenerate],
                 queue=True
             )
             clear.click(
                 clear_fn,
                 inputs=None,
-                outputs=[chatbot, msg, context_state],
+                outputs=[chatbot, msg, context_state, regenerate],
                 queue=False
             )
 
@@ -413,6 +436,7 @@ class LMClient(object):
     def get_default_config(updates=None):
         config = ConfigDict()
         config.url = 'http://localhost:5007'
+        config.batch_size = 1
         config.wait_for_ready = True
         config.dummy = False
 
@@ -435,49 +459,97 @@ class LMClient(object):
             except (Timeout, ConnectionError) as e:
                 time.sleep(10)
 
+    @staticmethod
+    def batched(iterator, batch_size):
+        batch = []
+        for example in iterator:
+            batch.append(example)
+            if len(batch) == batch_size:
+                yield batch
+                batch = []
+        if len(batch) > 0:
+            yield batch
+
     def loglikelihood(self, prefix, text):
         prefix, text = list(prefix), list(text)
         if self.config.dummy:
             return [-1.0 for _ in text], [False for _ in text]
 
-        response = requests.post(
-            urllib.parse.urljoin(self.config.url, 'loglikelihood'),
-            json={'prefix_text': prefix, 'text': text}
-        ).json()
-        return response['log_likelihood'], response['is_greedy']
+        log_likelihood = []
+        is_greedy = []
+
+        batched_iterator = list(zip(
+            self.batched(prefix, self.config.batch_size),
+            self.batched(text, self.config.batch_size)
+        ))
+        for batch_prefix, batch_text in tqdm(batched_iterator, ncols=0):
+            response = requests.post(
+                urllib.parse.urljoin(self.config.url, 'loglikelihood'),
+                json={'prefix_text': batch_prefix, 'text': batch_text}
+            ).json()
+            log_likelihood.extend(response['log_likelihood'])
+            is_greedy.extend(response['is_greedy'])
+
+        return log_likelihood, is_greedy
 
     def loglikelihood_rolling(self, text):
         text = list(text)
         if self.config.dummy:
             return [-1.0 for _ in text], [False for _ in text]
-        response = requests.post(
-            urllib.parse.urljoin(self.config.url, 'loglikelihood-rolling'),
-            json={'text': text}
-        ).json()
-        return response['log_likelihood'], response['is_greedy']
+
+        log_likelihood = []
+        is_greedy = []
+        batched_iterator = list(self.batched(text, self.config.batch_size))
+        for batch_text in tqdm(batched_iterator, ncols=0):
+            response = requests.post(
+                urllib.parse.urljoin(self.config.url, 'loglikelihood-rolling'),
+                json={'text': batch_text}
+            ).json()
+            log_likelihood.extend(response['log_likelihood'])
+            is_greedy.extend(response['is_greedy'])
+        return log_likelihood, is_greedy
 
     def greedy_until(self, prefix, until):
         prefix, until = list(prefix), list(until)
         if self.config.dummy:
-            return until
-        response = requests.post(
-            urllib.parse.urljoin(self.config.url, 'greedy-until'),
-            json={'prefix_text': prefix, 'until': until}
-        ).json()
-        return response['output_text']
+            results = []
+            for u in until:
+                if isinstance(u, str):
+                    results.append('dummy text ' + u)
+                else:
+                    results.append('dummy text ' + u[0])
+            return results
+
+        batched_iterator = list(zip(
+            self.batched(prefix, self.config.batch_size),
+            self.batched(until, self.config.batch_size),
+        ))
+        output_text = []
+        for batch_prefix, batch_until in tqdm(batched_iterator, ncols=0):
+            response = requests.post(
+                urllib.parse.urljoin(self.config.url, 'greedy-until'),
+                json={'prefix_text': batch_prefix, 'until': batch_until}
+            ).json()
+            output_text.extend(response['output_text'])
+        return output_text
 
     def generate(self, prefix, temperature=None):
         prefix = list(prefix)
         if self.config.dummy:
             return ['' for _ in prefix]
-        response = requests.post(
-            urllib.parse.urljoin(self.config.url, 'generate'),
-            json={
-                'prefix_text': prefix,
-                'temperature': temperature,
-            }
-        ).json()
-        return response['output_text']
+
+        output_text = []
+        batched_iterator = list(self.batched(prefix, self.config.batch_size))
+        for batch_prefix in tqdm(batched_iterator, ncols=0):
+            response = requests.post(
+                urllib.parse.urljoin(self.config.url, 'generate'),
+                json={
+                    'prefix_text': batch_prefix,
+                    'temperature': temperature,
+                }
+            ).json()
+            output_text.extend(response['output_text'])
+        return output_text
 
     def chat(self, prompt, context, temperature=None):
         if self.config.dummy:

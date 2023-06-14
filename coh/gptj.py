@@ -1,20 +1,3 @@
-# coding=utf-8
-# Copyright 2021 The EleutherAI and The HuggingFace Inc. team.
-# Modifications copyright 2022 Xinyang Geng
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 from functools import partial
 from typing import Optional, Tuple
 import json
@@ -37,20 +20,35 @@ from transformers.modeling_flax_utils import ACT2FN, FlaxPreTrainedModel, append
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging
 from transformers.generation.flax_logits_process import FlaxLogitsProcessorList
 from transformers import AutoTokenizer
-from jax.experimental import PartitionSpec
+from jax.sharding import PartitionSpec
 
 from ml_collections import ConfigDict
 from ml_collections.config_dict import config_dict
-from coh.utils import function_args_to_config, load_pickle, open_file
+from coh.tools.utils import function_args_to_config, load_pickle, open_file
+from coh.tools.jax_utils import (
+    with_sharding_constraint, get_jax_mesh, get_gradient_checkpoint_policy
+)
 
-from coh.jax_utils import with_sharding_constraint
-
-
-"""
-The follow code is taken from
-transformers/src/transformers/models/gptj/configuration_gptj.py
-and modified to work with coh.
-"""
+GPTJ_STANDARD_CONFIGS = {
+    '6b': {
+        "vocab_size": 50400,
+        "n_positions": 2048,
+        "n_embd": 4096,
+        "n_layer": 28,
+        "n_head": 16,
+        "rotary_dim": 64,
+        "n_inner": None,
+        "activation_function": "gelu_new",
+        "layer_norm_epsilon": 1e-5,
+        "initializer_range": 0.02,
+        "scale_attn_weights": True,
+        "use_cache": True,
+        "bos_token_id": 50256,
+        "eos_token_id": 50256,
+        "tie_word_embeddings": False,
+        "n_real_tokens": 50257,
+    }
+}
 
 
 class GPTJConfig(PretrainedConfig):
@@ -133,6 +131,7 @@ class GPTJConfig(PretrainedConfig):
         eos_token_id=50256,
         tie_word_embeddings=False,
         gradient_checkpointing=True,
+        gradient_checkpointing_policy='nothing_saveable',
         n_real_tokens=50257,
         fcm_min_ratio=0.0,
         fcm_max_ratio=0.0,
@@ -154,6 +153,7 @@ class GPTJConfig(PretrainedConfig):
         self.scale_attn_weights = scale_attn_weights
         self.use_cache = use_cache
         self.gradient_checkpointing = gradient_checkpointing
+        self.gradient_checkpointing_policy = gradient_checkpointing_policy
         self.n_real_tokens = n_real_tokens
         self.fcm_min_ratio = fcm_min_ratio
         self.fcm_max_ratio = fcm_max_ratio
@@ -181,6 +181,10 @@ class GPTJConfig(PretrainedConfig):
         return config
 
     @staticmethod
+    def get_jax_mesh(axis_dims):
+        return get_jax_mesh(axis_dims, ('dp', 'fsdp', 'mp'))
+
+    @staticmethod
     def get_partition_rules():
         """ Parition rules for GPTJ. Note that these rules are orderd, so that
             the beginning rules match first. It is important to use
@@ -188,18 +192,18 @@ class GPTJConfig(PretrainedConfig):
             None as a pytree leaf.
         """
         return (
-            ('transformer/wte/embedding', PartitionSpec('mp', None)),
-            ('attn/(k_proj|q_proj|v_proj)/kernel', PartitionSpec(None, 'mp')),
-            ('attn/out_proj/kernel', PartitionSpec('mp', None)),
-            ('mlp/fc_in/kernel', PartitionSpec(None, 'mp')),
+            ('transformer/wte/embedding', PartitionSpec('mp', 'fsdp')),
+            ('attn/(k_proj|q_proj|v_proj)/kernel', PartitionSpec('fsdp', 'mp')),
+            ('attn/out_proj/kernel', PartitionSpec('mp', 'fsdp')),
+            ('mlp/fc_in/kernel', PartitionSpec('fsdp', 'mp')),
             ('mlp/fc_in/bias', PartitionSpec('mp')),
-            ('mlp/fc_out/kernel', PartitionSpec('mp', None)),
+            ('mlp/fc_out/kernel', PartitionSpec('mp', 'fsdp')),
             ('mlp/fc_out/bias', PartitionSpec()),
             ('ln_[0-9]+/bias', PartitionSpec()),
             ('[0-9]+/ln_[0-9]+/scale', PartitionSpec()),
             ('ln_f/bias', PartitionSpec()),
             ('ln_f/scale', PartitionSpec()),
-            ('lm_head/kernel', PartitionSpec(None, 'mp')),
+            ('lm_head/kernel', PartitionSpec('fsdp', 'mp')),
             ('lm_head/bias', PartitionSpec('mp')),
             ('.*', PartitionSpec()),
         )
@@ -251,10 +255,12 @@ class GPTJConfig(PretrainedConfig):
                 name, _do_init=False, dtype=dtype
             )[1]
             params = freeze({'params': params})
-        return params
+        return jax.device_get(params)
 
     @classmethod
     def load_config(cls, path):
+        if path in GPTJ_STANDARD_CONFIGS:
+            return cls.from_dict(GPTJ_STANDARD_CONFIGS[path])
         load_type, load_path = path.split('::', 1)
         if load_type == 'pickle':
             return cls.from_dict(load_pickle(load_path)['gptj_config'])
@@ -271,7 +277,7 @@ class GPTJConfig(PretrainedConfig):
 """
 The follow code is taken from
 transformers/src/transformers/models/gptj/modeling_flax_gptj.py
-and modified to work with coh.
+and modified to work with EasyLM.
 """
 
 logger = logging.get_logger(__name__)
@@ -525,7 +531,7 @@ class FlaxGPTJAttention(nn.Module):
             dropout_rng=dropout_rng,
             dropout_rate=self.config.attn_pdrop,
             deterministic=deterministic,
-            dtype=self.dtype,
+            dtype=jnp.promote_types(self.dtype, jnp.float32),
             precision=None,
         )
 
@@ -572,7 +578,10 @@ class FlaxGPTJBlock(nn.Module):
         hidden_size = self.config.hidden_size
         inner_dim = self.config.n_inner if self.config.n_inner is not None else 4 * hidden_size
 
-        self.ln_1 = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
+        self.ln_1 = nn.LayerNorm(
+            epsilon=self.config.layer_norm_epsilon,
+            dtype=jnp.promote_types(self.dtype, jnp.float32)
+        )
         self.attn = FlaxGPTJAttention(self.config, dtype=self.dtype)
 
         self.mlp = FlaxGPTJMLP(self.config, inner_dim, dtype=self.dtype)
@@ -769,7 +778,12 @@ class FlaxGPTJBlockCollection(nn.Module):
     def setup(self):
         block = FlaxGPTJBlock
         if self.config.gradient_checkpointing:
-            FlaxGPT2CheckpointBlock = remat(block, static_argnums=(3, 4, 5))
+            FlaxGPT2CheckpointBlock = remat(
+                block, static_argnums=(3, 4, 5),
+                policy=get_gradient_checkpoint_policy(
+                    self.config.gradient_checkpointing_policy
+                )
+            )
             block = FlaxGPT2CheckpointBlock
         self.blocks = [
             block(self.config, name=str(i), dtype=self.dtype) for i in range(self.config.num_hidden_layers)
@@ -844,7 +858,10 @@ class FlaxGPTJModule(nn.Module):
         )
         self.dropout = nn.Dropout(rate=self.config.embd_pdrop)
         self.h = FlaxGPTJBlockCollection(self.config, dtype=self.dtype)
-        self.ln_f = nn.LayerNorm(epsilon=self.config.layer_norm_epsilon, dtype=self.dtype)
+        self.ln_f = nn.LayerNorm(
+            epsilon=self.config.layer_norm_epsilon,
+            dtype=jnp.promote_types(self.dtype, jnp.float32)
+        )
 
     def __call__(
         self,

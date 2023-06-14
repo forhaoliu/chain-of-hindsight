@@ -3,7 +3,7 @@ import pprint
 from functools import partial
 import json
 
-import coh.utils as utils
+import coh.tools.utils as utils
 from ml_collections.config_dict import config_dict
 from ml_collections import ConfigDict
 from tqdm import tqdm, trange

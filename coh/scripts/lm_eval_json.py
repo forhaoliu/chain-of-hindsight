@@ -1,6 +1,6 @@
 import json
-import coh.utils as utils
-from coh.serving import LMClient
+import coh.tools.utils as utils
+from coh.tools.serving import LMClient
 
 
 FLAGS, FLAGS_DEF = utils.define_flags_with_default(

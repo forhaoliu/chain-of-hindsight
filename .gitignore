@@ -146,5 +146,3 @@ local/
 
 # Job scripts
 jobs/
-!jobs/tpu_control.sh
-!jobs/pod_test.sh

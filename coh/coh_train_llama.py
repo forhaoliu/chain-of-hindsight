@@ -1,40 +1,32 @@
-import dataclasses
 import pprint
 from functools import partial
-import re
 
 from tqdm import tqdm, trange
 import numpy as np
-import coh.utils as utils
+import coh.tools.utils as utils
 
 import jax
 import jax.numpy as jnp
-from jax.experimental.pjit import pjit, with_sharding_constraint
-from jax.experimental import PartitionSpec as PS
-import flax
-from flax import linen as nn
-from flax.jax_utils import prefetch_to_device
+from jax.experimental.pjit import pjit
+from jax.sharding import PartitionSpec as PS
 from flax.training.train_state import TrainState
-import optax
 
-from coh.data import PretrainDataset
-from coh.checkpoint import StreamingCheckpointer
-from coh.optimizers import OptimizerFactory
-from coh.jax_utils import (
-    JaxRNG, get_jax_mp_mesh, next_rng, match_partition_rules,
-    cross_entropy_loss_and_accuracy, named_tree_map, global_norm,
+from coh.data import DatasetOption
+from coh.tools.checkpoint import StreamingCheckpointer
+from coh.tools.optimizers import OptimizerFactory
+from coh.tools.jax_utils import (
+    JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
+    cross_entropy_loss_and_accuracy, global_norm, get_float_dtype_by_name,
     set_random_seed, average_metrics, get_weight_decay_mask,
-    make_shard_and_gather_fns, tree_apply
+    make_shard_and_gather_fns, with_sharding_constraint,
 )
-from coh.models.llama.llama_model import (
-    LLaMAConfig, FlaxLLaMAForCausalLM, FlaxLLaMAForCausalLMModule
-)
+from coh.llama import LLaMAConfig, FlaxLLaMAForCausalLMModule
 
 
 FLAGS, FLAGS_DEF = utils.define_flags_with_default(
     seed=42,
-    initialize_jax_distributed=False,
-    mp_mesh_dim='1,-1',
+    mesh_dim='1,-1,1',
+    dtype='fp32',
     total_steps=10000,
     load_llama_config='',
     update_llama_config='',
@@ -43,22 +35,24 @@ FLAGS, FLAGS_DEF = utils.define_flags_with_default(
     log_freq=50,
     save_model_freq=0,
     save_milestone_freq=0,
-    save_optimizer_state=False,
     eval_steps=0,
     tokenizer=LLaMAConfig.get_tokenizer_config(),
-    train_dataset=PretrainDataset.get_default_config(),
-    eval_dataset=PretrainDataset.get_default_config(),
+    hf_train_dataset=DatasetOption.get_default_config(),
+    pt_train_dataset=DatasetOption.get_default_config(),
+    hf_eval_dataset=DatasetOption.get_default_config(),
+    pt_eval_dataset=DatasetOption.get_default_config(),
+    pt_loss_weight=0.01,
     optimizer=OptimizerFactory.get_default_config(),
+    checkpointer=StreamingCheckpointer.get_default_config(),
     llama=LLaMAConfig.get_default_config(),
     logger=utils.WandBLogger.get_default_config(),
     log_all_worker=False,
+    jax_distributed=JaxDistributedConfig.get_default_config(),
 )
 
 
 def main(argv):
-    if FLAGS.initialize_jax_distributed:
-        jax.distributed.initialize()
-
+    JaxDistributedConfig.initialize(FLAGS.jax_distributed)
     variant = utils.get_user_flags(FLAGS, FLAGS_DEF)
     flags_config_dict = utils.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
     logger = utils.WandBLogger(
@@ -69,18 +63,26 @@ def main(argv):
     set_random_seed(FLAGS.seed)
 
     if FLAGS.load_dataset_state != '':
-        dataset = utils.load_pickle(FLAGS.load_dataset_state)
+        hf, pt = FLAGS.load_dataset_state.split(',')
+        hf_dataset = utils.load_pickle(hf)
+        pt_dataset = utils.load_pickle(pt)
     else:
         tokenizer = LLaMAConfig.get_tokenizer(FLAGS.tokenizer)
-        dataset = PretrainDataset.load_dataset(FLAGS.train_dataset, tokenizer)
+        hf_dataset = DatasetOption.load_dataset(FLAGS.hf_train_dataset, tokenizer)
+        pt_dataset = DatasetOption.load_dataset(FLAGS.pt_train_dataset, tokenizer)
 
     if FLAGS.eval_steps > 0:
-        eval_dataset = PretrainDataset.load_dataset(
-            FLAGS.eval_dataset, dataset.tokenizer
+        hf_eval_dataset = DatasetOption.load_dataset(
+            FLAGS.hf_eval_dataset, hf_dataset.tokenizer
         )
-        eval_iterator = iter(eval_dataset)
+        pt_eval_dataset = DatasetOption.load_dataset(
+            FLAGS.pt_eval_dataset, pt_dataset.tokenizer
+        )
+        hf_eval_iterator = iter(hf_eval_dataset)
+        pt_eval_iterator = iter(pt_eval_dataset)
 
-    seq_length = dataset.seq_length
+    assert hf_dataset.seq_length == pt_dataset.seq_length, "HF and PT datasets must have the same sequence length."
+    seq_length = hf_dataset.seq_length
 
     if FLAGS.load_llama_config != '':
         llama_config = LLaMAConfig.load_config(FLAGS.load_llama_config)
@@ -91,12 +93,15 @@ def main(argv):
         llama_config.update(dict(eval(FLAGS.update_llama_config)))
 
     llama_config.update(dict(
-        bos_token_id=dataset.tokenizer.bos_token_id,
-        eos_token_id=dataset.tokenizer.eos_token_id,
+        bos_token_id=hf_dataset.tokenizer.bos_token_id,
+        eos_token_id=hf_dataset.tokenizer.eos_token_id,
     ))
-    if llama_config.vocab_size < dataset.vocab_size:
-        llama_config.update(dict(vocab_size=dataset.vocab_size))
-    model = FlaxLLaMAForCausalLMModule(llama_config)
+    if llama_config.vocab_size < hf_dataset.vocab_size:
+        llama_config.update(dict(vocab_size=hf_dataset.vocab_size))
+
+    model = FlaxLLaMAForCausalLMModule(
+        llama_config, dtype=get_float_dtype_by_name(FLAGS.dtype)
+    )
 
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(
         FLAGS.optimizer,
@@ -116,11 +121,11 @@ def main(argv):
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
-    def train_step(train_state, rng, batch):
+    def train_step(train_state, rng, hf_batch, pt_batch):
         rng_generator = JaxRNG(rng)
-        tokens = with_sharding_constraint(batch['tokens'], PS('dp'))
-        loss_masks = with_sharding_constraint(batch['loss_masks'], PS('dp'))
-        def loss_and_accuracy(params):
+        def loss_and_accuracy(params, batch):
+            tokens = with_sharding_constraint(batch['tokens'], PS('dp'))
+            loss_masks = with_sharding_constraint(batch['loss_masks'], PS('dp'))
             bos_tokens = jnp.full(
                 (tokens.shape[0], 1), llama_config.bos_token_id, dtype=jnp.int32
             )
@@ -130,35 +135,48 @@ def main(argv):
                 rngs=rng_generator(llama_config.rng_keys()),
             ).logits
             return cross_entropy_loss_and_accuracy(logits, tokens, loss_masks)
-        grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
-        (loss, accuracy), grads = grad_fn(train_state.params)
+        grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True, argnums=0)
+        (hf_loss, hf_accuracy), hf_grads = grad_fn(train_state.params, hf_batch)
+        (pt_loss, pt_accuracy), pt_grads = grad_fn(train_state.params, pt_batch)
+        grads = jax.tree_map(
+            lambda hf_grad, pt_grad: hf_grad + pt_grad * FLAGS.pt_loss_weight,
+            hf_grads, pt_grads,
+        )
         train_state = train_state.apply_gradients(grads=grads)
         metrics = dict(
-            loss=loss,
-            accuracy=accuracy,
+            hf_loss=hf_loss,
+            pt_loss=pt_loss,
+            hf_accuracy=hf_accuracy,
+            pt_accuracy=pt_accuracy,
             learning_rate=optimizer_info['learning_rate_schedule'](train_state.step),
             gradient_norm=global_norm(grads),
             param_norm=global_norm(train_state.params),
         )
         return train_state, rng_generator(), metrics
 
-    def eval_step(train_state, rng, batch):
+    def eval_step(train_state, rng, hf_batch, pt_batch):
         rng_generator = JaxRNG(rng)
-        tokens = with_sharding_constraint(batch['tokens'], PS('dp'))
-        loss_masks = with_sharding_constraint(batch['loss_masks'], PS('dp'))
-        bos_tokens = jnp.full(
-            (tokens.shape[0], 1), llama_config.bos_token_id, dtype=jnp.int32
-        )
-        inputs = jnp.concatenate([bos_tokens, tokens[:, :-1]], axis=1)
-        logits = model.apply(
-            train_state.params, inputs, deterministic=True,
-            rngs=rng_generator(llama_config.rng_keys()),
-        ).logits
-        loss, accuracy = cross_entropy_loss_and_accuracy(logits, tokens, loss_masks)
-        metrics = dict(
-            eval_loss=loss,
-            eval_accuracy=accuracy,
-        )
+        def loss_and_accuracy(params, batch):
+            tokens = with_sharding_constraint(batch['tokens'], PS('dp'))
+            loss_masks = with_sharding_constraint(batch['loss_masks'], PS('dp'))
+            bos_tokens = jnp.full(
+                (tokens.shape[0], 1), llama_config.bos_token_id, dtype=jnp.int32
+            )
+            inputs = jnp.concatenate([bos_tokens, tokens[:, :-1]], axis=1)
+            logits = model.apply(
+                params, inputs, deterministic=False,
+                rngs=rng_generator(llama_config.rng_keys()),
+            ).logits
+            return cross_entropy_loss_and_accuracy(logits, tokens, loss_masks)
+        hf_loss, hf_accuracy = loss_and_accuracy(train_state.params, hf_batch)
+        pt_loss, pt_accuracy = loss_and_accuracy(train_state.params, pt_batch)
+        aux = {
+            'hf_accuracy': hf_accuracy,
+            'pt_accuracy': pt_accuracy,
+            'hf_loss': hf_loss,
+            'pt_loss': pt_loss,
+        }
+        aux = {f'eval_{k}': v for k, v in aux.items()}
         return rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
@@ -170,34 +188,34 @@ def main(argv):
         train_state_partition, train_state_shapes
     )
     checkpointer = StreamingCheckpointer(
-        logger.checkpoint_dir, enable=jax.process_index() == 0,
-        save_optimizer_state=FLAGS.save_optimizer_state
+        FLAGS.checkpointer, logger.output_dir,
+        enable=jax.process_index() == 0,
     )
 
     sharded_init_fn = pjit(
         init_fn,
-        in_axis_resources=PS(),
-        out_axis_resources=train_state_partition
+        in_shardings=PS(),
+        out_shardings=train_state_partition
     )
 
     sharded_create_trainstate_from_params = pjit(
         create_trainstate_from_params,
-        in_axis_resources=(train_state_partition.params, ),
-        out_axis_resources=train_state_partition,
+        in_shardings=(train_state_partition.params, ),
+        out_shardings=train_state_partition,
         donate_argnums=(0, ),
     )
 
     sharded_train_step = pjit(
         train_step,
-        in_axis_resources=(train_state_partition, PS(), PS()),
-        out_axis_resources=(train_state_partition, PS(), PS()),
+        in_shardings=(train_state_partition, PS(), PS(), PS()),
+        out_shardings=(train_state_partition, PS(), PS()),
         donate_argnums=(0, 1),
     )
 
     sharded_eval_step = pjit(
         eval_step,
-        in_axis_resources=(train_state_partition, PS(), PS()),
-        out_axis_resources=(PS(), PS()),
+        in_shardings=(train_state_partition, PS(), PS(), PS()),
+        out_shardings=(PS(), PS()),
         donate_argnums=(1,),
     )
 
@@ -213,12 +231,10 @@ def main(argv):
             train_state=train_state,
             gather_fns=gather_fns,
             metadata=metadata,
-            dataset=dataset,
             milestone=milestone,
         )
 
-    mesh = get_jax_mp_mesh(FLAGS.mp_mesh_dim)
-    assert len(mesh.shape) == 3, 'MP mesh must be 2D'
+    mesh = LLaMAConfig.get_jax_mesh(FLAGS.mesh_dim)
     with mesh:
         train_state, restored_params = None, None
         if FLAGS.load_checkpoint != '':
@@ -243,9 +259,9 @@ def main(argv):
 
         step_counter = trange(start_step, FLAGS.total_steps, ncols=0)
 
-        for step, batch in zip(step_counter, dataset):
+        for step, hf_batch, pt_batch in zip(step_counter, hf_dataset, pt_dataset):
             train_state, sharded_rng, metrics = sharded_train_step(
-                train_state, sharded_rng, batch
+                train_state, sharded_rng, hf_batch, pt_batch
             )
 
             if step % FLAGS.log_freq == 0:
@@ -253,7 +269,7 @@ def main(argv):
                     eval_metric_list = []
                     for _ in range(FLAGS.eval_steps):
                         sharded_rng, eval_metrics = sharded_eval_step(
-                            train_state, sharded_rng, next(eval_iterator)
+                            train_state, sharded_rng, next(hf_eval_iterator), next(pt_eval_iterator),
                         )
                         eval_metric_list.append(eval_metrics)
                     metrics.update(average_metrics(eval_metric_list))

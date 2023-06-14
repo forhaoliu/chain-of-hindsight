@@ -8,13 +8,13 @@ from functools import partial
 import os
 from tqdm import tqdm, trange
 import numpy as np
-import coh.utils as utils
+import coh.tools.utils as utils
 
 from flax.traverse_util import flatten_dict
 from lm_eval import evaluator, tasks
 from lm_eval.base import LM
 
-from coh.serving import LMClient
+from coh.tools.serving import LMClient
 
 
 FLAGS, FLAGS_DEF = utils.define_flags_with_default(

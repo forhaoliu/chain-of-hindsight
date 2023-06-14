@@ -5,22 +5,19 @@ from functools import partial
 import re
 import dataclasses
 import random
+from ml_collections import ConfigDict
+from ml_collections.config_dict.config_dict import placeholder
 
-import dill
 import flax
 import jax
 import jax.numpy as jnp
-from jax.experimental import PartitionSpec as PS
+from jax.sharding import PartitionSpec as PS
+from jax.sharding import Mesh
+from jax.experimental import mesh_utils
 from jax.experimental.pjit import with_sharding_constraint as _with_sharding_constraint
-from jax.experimental.maps import Mesh
 from jax.experimental.pjit import pjit
 from jax.interpreters import pxla
 import numpy as np
-from absl import logging
-from flax import jax_utils
-from flax.training.train_state import TrainState
-from flax.core import FrozenDict
-import optax
 from transformers import FlaxLogitsWarper
 
 
@@ -48,6 +45,39 @@ class JaxRNG(object):
             split_rngs = jax.random.split(self.rng, num=len(keys) + 1)
             self.rng = split_rngs[0]
             return {key: val for key, val in zip(keys, split_rngs[1:])}
+
+
+class JaxDistributedConfig(object):
+    """ Utility class for initializing JAX distributed. """
+
+    @staticmethod
+    def get_default_config(updates=None):
+        config = ConfigDict()
+        config.initialize_jax_distributed = False
+        config.coordinator_address = placeholder(str)
+        config.num_processes = placeholder(int)
+        config.process_id = placeholder(int)
+        config.local_device_ids = placeholder(str)
+
+        if updates is not None:
+            config.update(ConfigDict(updates).copy_and_resolve_references())
+        return config
+
+    @classmethod
+    def initialize(cls, config):
+        config = cls.get_default_config(config)
+        if config.initialize_jax_distributed:
+            if config.local_device_ids is not None:
+                local_device_ids = [int(x) for x in config.local_device_ids.split(',')]
+            else:
+                local_device_ids = None
+
+            jax.distributed.initialize(
+                coordinator_address=config.coordinator_address,
+                num_processes=config.num_processes,
+                process_id=config.process_id,
+                local_device_ids=local_device_ids,
+            )
 
 
 class FlaxTemperatureLogitsWarper(FlaxLogitsWarper):
@@ -78,8 +108,8 @@ def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
     def make_shard_fn(partition_spec, dtype_spec=None):
         jax_shard_function = pjit(
             make_to_dtype_fn(dtype_spec),
-            in_axis_resources=None,
-            out_axis_resources=partition_spec
+            in_shardings=None,
+            out_shardings=partition_spec
         )
         def shard_fn(tensor):
             return jax_shard_function(tensor).block_until_ready()
@@ -88,8 +118,8 @@ def make_shard_and_gather_fns(partition_specs, dtype_specs=None):
     def make_gather_fn(partition_spec, dtype_spec=None):
         jax_gather_fn = pjit(
             make_to_dtype_fn(dtype_spec),
-            in_axis_resources=partition_spec,
-            out_axis_resources=None
+            in_shardings=partition_spec,
+            out_shardings=None
         )
         def gather_fn(tensor):
             return jax.device_get(jax_gather_fn(tensor))
@@ -114,28 +144,33 @@ def set_random_seed(seed):
     init_rng(seed)
 
 
-def get_jax_mp_mesh(mp_axis_dims, mp_axis_prefix='mp', dp_axis_name='dp'):
-    """ Return a 2D mesh for (MP, DP) partitioning. """
-    if isinstance(mp_axis_dims, int):
-        mp_axis_dims = [mp_axis_dims]
-    elif isinstance(mp_axis_dims, str):
-        mp_axis_dims = mp_axis_dims.strip().replace(' ', '')
-        mp_axis_dims = [int(x) for x in mp_axis_dims.split(',')]
-
-    device_count = jax.device_count()
-    mp_axis_dims = [x if x > 0 else device_count for x in mp_axis_dims]
-
-    total_mp_dims = np.prod(mp_axis_dims)
-    assert total_mp_dims <= device_count and device_count % total_mp_dims == 0
-
-    axis_names = [dp_axis_name]
-    if len(mp_axis_dims) == 1:
-        axis_names.append(mp_axis_prefix)
+def get_jax_mesh(axis_dims, names):
+    if axis_dims.startswith('!'):
+        # Allow splitting a physical mesh axis if needed
+        mesh_axis_splitting = True
+        axis_dims = axis_dims[1:]
     else:
-        for i in range(1, len(mp_axis_dims) + 1):
-            axis_names.append(f'{mp_axis_prefix}{i}')
+        mesh_axis_splitting = False
 
-    return Mesh(np.array(jax.devices()).reshape(-1, *mp_axis_dims), axis_names)
+    if ':' in axis_dims:
+        dims = []
+        dim_names = []
+        for axis in axis_dims.split(','):
+            name, dim = axis.split(':')
+            assert name in names
+            dims.append(int(dim))
+            dim_names.append(name)
+        assert(set(dim_names) == set(names))
+    else:
+        dims = [int(x) for x in axis_dims.split(',')]
+        dim_names = names
+    assert len(dims) == len(names)
+    mesh_shape = np.arange(jax.device_count()).reshape(dims).shape
+    if mesh_axis_splitting:
+        physical_mesh = np.array(jax.devices()).reshape(mesh_shape)
+    else:
+        physical_mesh = mesh_utils.create_device_mesh(mesh_shape)
+    return Mesh(physical_mesh, dim_names)
 
 
 def names_in_current_mesh(*names):
@@ -225,12 +260,12 @@ def cross_entropy_loss(logits, labels, smoothing_factor=0.):
     return -jnp.mean(jnp.sum(logp * labels, axis=-1))
 
 
-def cross_entropy_loss_and_accuracy(logits, tokens, valid=None, batch_stat=False):
+def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
     if valid is None:
         valid = jnp.ones(tokens.shape[:2])
     valid = valid.astype(jnp.float32)
     valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
-
+    logits = logits.astype(jnp.float32) # for numerical stability
     token_log_prob = jnp.squeeze(
         jnp.take_along_axis(
             jax.nn.log_softmax(logits, axis=-1),
@@ -240,21 +275,14 @@ def cross_entropy_loss_and_accuracy(logits, tokens, valid=None, batch_stat=False
         -1,
     )
     token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
-    batch_loss = -jnp.mean(token_log_prob, axis=0)
     loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
     correct = jnp.where(
-        valid > 0.0, jnp.argmax(logits, axis=-1) == tokens, jnp.array(False)
+        valid > 0.0,
+        jnp.argmax(logits, axis=-1) == tokens,
+        jnp.array(False)
     )
-    batch_accuracy = jnp.mean(correct, axis=0)
     accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
-    if batch_stat:
-        stat = {
-            "batch_loss": batch_loss,
-            "batch_accuracy": batch_accuracy,
-        }
-        return loss, accuracy, stat
-    else:
-        return loss, accuracy
+    return loss, accuracy
 
 
 def global_norm(tree):
@@ -274,79 +302,77 @@ def average_metrics(metrics):
 def get_float_dtype_by_name(dtype):
     return {
         'bf16': jnp.bfloat16,
+        'bfloat16': jnp.bfloat16,
         'fp16': jnp.float16,
+        'float16': jnp.float16,
         'fp32': jnp.float32,
+        'float32': jnp.float32,
         'fp64': jnp.float64,
+        'float64': jnp.float64,
     }[dtype]
 
 
-def float_to_dtype(tree, dtype):
+def float_tensor_to_dtype(tensor, dtype):
+    if dtype is None or dtype == '':
+        return tensor
+    if isinstance(dtype, str):
+        dtype = get_float_dtype_by_name(dtype)
     float_dtypes = (jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64)
-    def to_dtype(x):
-        if getattr(x, 'dtype', None) in float_dtypes:
-            x = x.astype(dtype)
-        return x
-    return jax.tree_util.tree_map(to_dtype, tree)
+    if getattr(tensor, 'dtype', None) in float_dtypes:
+        tensor = tensor.astype(dtype)
+    return tensor
+
+
+def float_to_dtype(tree, dtype):
+    return jax.tree_util.tree_map(
+        partial(float_tensor_to_dtype, dtype=dtype), tree
+    )
+
+
+def get_gradient_checkpoint_policy(name):
+    return {
+        'everything_saveable': jax.checkpoint_policies.everything_saveable,
+        'nothing_saveable': jax.checkpoint_policies.nothing_saveable,
+        'dots_saveable': jax.checkpoint_policies.dots_saveable,
+        'dots_with_no_batch_dims_saveable': jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
+    }[name]
+
+
+def tree_path_to_string(path, sep=None):
+    keys = []
+    for key in path:
+        if isinstance(key, jax.tree_util.SequenceKey):
+            keys.append(str(key.idx))
+        elif isinstance(key, jax.tree_util.DictKey):
+            keys.append(str(key.key))
+        elif isinstance(key, jax.tree_util.GetAttrKey):
+            keys.append(str(key.name))
+        elif isinstance(key, jax.tree_util.FlattenedIndexKey):
+            keys.append(str(key.key))
+        else:
+            keys.append(str(key))
+    if sep is None:
+        return tuple(keys)
+    return sep.join(keys)
 
 
 def flatten_tree(xs, is_leaf=None, sep=None):
-    """ A stronger version of flax.traverse_util.flatten_dict, supports
-        dict, tuple, list and TrainState. Tuple and list indices will be
-        converted to strings.
-    """
-    tree_node_classes = (FrozenDict, dict, tuple, list, TrainState)
-    if not isinstance(xs, tree_node_classes):
-        ValueError('fUnsupported node type: {type(xs)}')
-
-    def _is_leaf(prefix, fx):
-        if is_leaf is not None:
-            return is_leaf(prefix, xs)
-        return False
-
-    def _key(path):
-        if sep is None:
-            return path
-        return sep.join(path)
-
-    def _convert_to_dict(xs):
-        if isinstance(xs, (FrozenDict, dict)):
-            return xs
-        elif isinstance(xs, (tuple, list)):
-            return {f'{i}': v for i, v in enumerate(xs)}
-        elif isinstance(xs, TrainState):
-            output = {}
-            for field in dataclasses.fields(xs):
-                if 'pytree_node' not in field.metadata or field.metadata['pytree_node']:
-                    output[field.name] = getattr(xs, field.name)
-            return output
-        else:
-            raise ValueError('fUnsupported node type: {type(xs)}')
-
-    def _flatten(xs, prefix):
-        if not isinstance(xs, tree_node_classes) or _is_leaf(prefix, xs):
-            return {_key(prefix): xs}
-
-        result = {}
-        is_empty = True
-        for (key, value) in _convert_to_dict(xs).items():
-            is_empty = False
-            path = prefix + (key, )
-            result.update(_flatten(value, path))
-        return result
-
-    return _flatten(xs, ())
+    flattened, _ = jax.tree_util.tree_flatten_with_path(xs, is_leaf=is_leaf)
+    output = {}
+    for key, val in flattened:
+        output[tree_path_to_string(key, sep=sep)] = val
+    return output
 
 
-def named_tree_map(f, tree, is_leaf=None, sep=None):
+def named_tree_map(f, tree, *rest, is_leaf=None, sep=None):
     """ An extended version of jax.tree_util.tree_map, where the mapped function
         f takes both the name (path) and the tree leaf as input.
     """
-    flattened_tree = flatten_tree(tree, is_leaf=is_leaf, sep=sep)
-    id_to_name = {id(val): key for key, val in flattened_tree.items()}
-    def map_fn(leaf):
-        name = id_to_name[id(leaf)]
-        return f(name, leaf)
-    return jax.tree_util.tree_map(map_fn, tree)
+    return jax.tree_util.tree_map_with_path(
+        lambda path, x, *r: f(tree_path_to_string(path, sep=sep), x, *r),
+        tree, *rest,
+        is_leaf=is_leaf
+    )
 
 
 def match_partition_rules(rules, params):

@@ -7,7 +7,7 @@ import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from copy import copy
+from copy import deepcopy
 from io import BytesIO
 from socket import gethostname
 import dataclasses
@@ -36,31 +36,32 @@ class WandBLogger(object):
     def get_default_config(updates=None):
         config = ConfigDict()
         config.project_id = ""
-        config.async_save = True
         config.project_entity = placeholder(str)
         config.experiment_id = placeholder(str)
+        config.append_uuid = True
         config.experiment_note = placeholder(str)
 
         config.output_dir = "/tmp/"
-        config.gcs_output_dir = ""
+        config.wandb_dir = ""
+        config.profile_dir = ""
 
         config.online = False
 
-        if updates is not None:
-            config.update(ConfigDict(updates).copy_and_resolve_references())
-        return config
+        return update_config_dict(config, updates)
 
     def __init__(self, config, variant, enable=True):
         self.enable = enable
         self.config = self.get_default_config(config)
-        self.async_manager = ThreadPoolExecutor(max_workers=1)
 
         if self.config.experiment_id is None or self.config.experiment_id == "":
             self.config.experiment_id = uuid.uuid4().hex
         else:
-            self.config.experiment_id = (
-                str(self.config.experiment_id) + "_" + uuid.uuid4().hex
-            )
+            if self.config.append_uuid:
+                self.config.experiment_id = (
+                    str(self.config.experiment_id) + "_" + uuid.uuid4().hex
+                )
+            else:
+                self.config.experiment_id = str(self.config.experiment_id)
 
         if self.enable:
             if self.config.output_dir == "":
@@ -69,28 +70,52 @@ class WandBLogger(object):
                 self.config.output_dir = os.path.join(
                     self.config.output_dir, self.config.experiment_id
                 )
-                os.makedirs(self.config.output_dir, exist_ok=True)
+                if not self.config.output_dir.startswith("gs://"):
+                    os.makedirs(self.config.output_dir, exist_ok=True)
 
-            if self.config.gcs_output_dir != "":
-                self.config.gcs_output_dir = os.path.join(
-                    self.config.gcs_output_dir, self.config.experiment_id
+            if self.config.wandb_dir == "":
+                if not self.config.output_dir.startswith("gs://"):
+                    # Use the same directory as output_dir if it is not a GCS path.
+                    self.config.wandb_dir = self.config.output_dir
+                else:
+                    # Otherwise, use a temporary directory.
+                    self.config.wandb_dir = tempfile.mkdtemp()
+            else:
+                # Join the wandb_dir with the experiment_id.
+                self.config.wandb_dir = os.path.join(
+                    self.config.wandb_dir, self.config.experiment_id
                 )
+                os.makedirs(self.config.wandb_dir, exist_ok=True)
 
-        self._variant = copy(variant)
+            if self.config.profile_dir == "":
+                if not self.config.output_dir.startswith("gs://"):
+                    # Use the same directory as output_dir if it is not a GCS path.
+                    self.config.profile_dir = self.config.output_dir
+                else:
+                    # Otherwise, use a temporary directory.
+                    self.config.profile_dir = tempfile.mkdtemp()
+            else:
+                # Join the profile_dir with the experiment_id.
+                self.config.profile_dir = os.path.join(
+                    self.config.profile_dir, self.config.experiment_id
+                )
+                os.makedirs(self.config.profile_dir, exist_ok=True)
+
+        self._variant = flatten_config_dict(variant)
 
         if "hostname" not in self._variant:
             self._variant["hostname"] = gethostname()
 
         if self.enable:
             self.run = wandb.init(
+                reinit=True,
                 config=self._variant,
                 project=self.config.project_id,
-                entity=self.config.project_entity,
-                dir=self.config.output_dir,
+                dir=self.config.wandb_dir,
                 id=self.config.experiment_id,
                 resume="allow",
-                reinit=True,
                 notes=self.config.experiment_note,
+                entity=self.config.project_entity,
                 settings=wandb.Settings(
                     start_method="thread",
                     _disable_stats=True,
@@ -104,43 +129,9 @@ class WandBLogger(object):
         if self.enable:
             self.run.log(*args, **kwargs)
 
-    def _save_pickle_worker(self, obj, filename):
-        if self.enable:
-            if self.config.gcs_output_dir != "":
-                path = os.path.join(self.config.gcs_output_dir, filename)
-            else:
-                path = os.path.join(self.config.output_dir, filename)
-
-            with open_file(path, "wb") as fout:
-                pickle.dump(obj, fout)
-
     def save_pickle(self, obj, filename):
-        if self.config.async_save:
-            self.async_manager.submit(self._save_pickle_worker, obj, filename)
-        else:
-            self._save_pickle_worker(obj, filename)
-
-    def _save_checkpoint_worker(self, train_state, filename):
         if self.enable:
-            if self.config.gcs_output_dir != "":
-                path = os.path.join(self.config.gcs_output_dir, filename)
-            else:
-                path = os.path.join(self.config.output_dir, filename)
-
-            packer = msgpack.Packer()
-            flattend_train_state = flax.traverse_util.flatten_dict(train_state)
-            with open_file(path, "wb") as fout:
-                for key, value in flattend_train_state.items():
-                    fout.write(packer.pack((key, to_bytes(value))))
-
-    def save_checkpoint(self, train_state, filename):
-        train_state = flax.serialization.to_state_dict(train_state)
-        if self.config.async_save:
-            self.async_manager.submit(
-                self._save_checkpoint_worker, train_state, filename
-            )
-        else:
-            self._save_checkpoint_worker(train_state, filename)
+            save_pickle(obj, os.path.join(self.config.output_dir, filename))
 
     @property
     def experiment_id(self):
@@ -155,11 +146,12 @@ class WandBLogger(object):
         return self.config.output_dir
 
     @property
-    def checkpoint_dir(self):
-        if self.config.gcs_output_dir != "":
-            return self.config.gcs_output_dir
-        return self.config.output_dir
+    def wandb_dir(self):
+        return self.config.wandb_dir
 
+    @property
+    def profile_dir(self):
+        return self.config.profile_dir
 
 def config_dict(*args, **kwargs):
     return ConfigDict(dict(*args, **kwargs))
@@ -218,6 +210,13 @@ def user_flags_to_config_dict(flags, flags_def):
         output[key] = getattr(flags, key)
 
     return output
+
+
+def update_config_dict(config, updates=None):
+    updated_config = deepcopy(config)
+    if updates is not None:
+        updated_config.update(ConfigDict(updates).copy_and_resolve_references())
+    return updated_config
 
 
 def flatten_config_dict(config, prefix=None):

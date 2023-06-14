@@ -38,7 +38,7 @@ import json
 import re
 from tqdm import tqdm, trange
 import absl
-import coh.utils as utils
+import coh.tools.utils as utils
 
 
 FLAGS, FLAGS_DEF = utils.define_flags_with_default(

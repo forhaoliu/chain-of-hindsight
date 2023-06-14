@@ -1,6 +1,7 @@
 import os
 import numpy as np
-import coh.utils as utils
+from ml_collections import ConfigDict
+import coh.tools.utils as utils
 import jax
 import jax.numpy as jnp
 import flax
@@ -10,7 +11,7 @@ from flax.serialization import (
 from flax.traverse_util import flatten_dict, unflatten_dict, empty_node
 import msgpack
 
-from coh.jax_utils import tree_apply
+from coh.tools.jax_utils import tree_apply, float_tensor_to_dtype
 
 
 class StreamingCheckpointer(object):
@@ -19,16 +20,32 @@ class StreamingCheckpointer(object):
         out of memory or local TPU disk with default flax checkpointer.
     """
 
-    def __init__(self, checkpoint_dir, enable=True, save_optimizer_state=False):
+    @staticmethod
+    def get_default_config(updates=None):
+        config = ConfigDict()
+        config.float_dtype = 'bf16'
+        config.save_optimizer_state = False
+
+        if updates is not None:
+            config.update(ConfigDict(updates).copy_and_resolve_references())
+        return config
+
+    def __init__(self, config, checkpoint_dir, enable=True):
+        self.config = self.get_default_config(config)
         self.checkpoint_dir = checkpoint_dir
         self.enable = enable
-        self.save_optimizer_state = save_optimizer_state
 
     def save_checkpoint(self, train_state, filename, gather_fns=None):
         if self.enable:
             path = os.path.join(self.checkpoint_dir, filename)
         else:
             path = '/dev/null'
+        self.save_train_state_to_file(
+            train_state, path, gather_fns, self.config.float_dtype
+        )
+
+    @staticmethod
+    def save_train_state_to_file(train_state, path, gather_fns=None, float_dtype=None):
         train_state = to_state_dict(train_state)
         packer = msgpack.Packer()
         flattend_train_state = flatten_dict(train_state)
@@ -39,6 +56,7 @@ class StreamingCheckpointer(object):
             for key, value in flattend_train_state.items():
                 if gather_fns is not None:
                     value = gather_fns[key](value)
+                value = float_tensor_to_dtype(value, float_dtype)
                 fout.write(packer.pack((key, to_bytes(value))))
 
     def save_pickle(self, obj, filename):
@@ -50,7 +68,7 @@ class StreamingCheckpointer(object):
 
     def save_all(self, train_state, gather_fns, metadata=None, dataset=None, milestone=False):
         step = int(jax.device_get(train_state.step))
-        if self.save_optimizer_state:
+        if self.config.save_optimizer_state:
             checkpoint_state = train_state
             checkpoint_name = 'streaming_train_state'
             checkpoint_gather_fns = gather_fns
@@ -131,7 +149,9 @@ class StreamingCheckpointer(object):
         return from_state_dict(target, state_dict)
 
     @classmethod
-    def load_trainstate_checkpoint(cls, load_from, trainstate_target=None, trainstate_shard_fns=None):
+    def load_trainstate_checkpoint(cls, load_from, trainstate_target=None,
+                                   trainstate_shard_fns=None,
+                                   disallow_trainstate=False):
         if trainstate_target is not None:
             params_target = trainstate_target.params['params']
         else:
@@ -143,6 +163,8 @@ class StreamingCheckpointer(object):
             params_shard_fns = None
 
         load_type, load_path = load_from.split('::', 1)
+        if disallow_trainstate:
+            assert load_type != 'trainstate', 'Loading full trainstate is not allowed!'
         train_state = None
         restored_params = None
         if load_type == 'trainstate':
