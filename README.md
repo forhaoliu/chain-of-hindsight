@@ -6,8 +6,6 @@ Paper: https://arxiv.org/abs/2302.02676
 
 Jax implementation of the Chain-of-Hindsight (CoH) idea proposed in [Chain of Hindsight aligns Language Models with Feedback](https://arxiv.org/abs/2302.02676).
 
-This implementation allows learning both small and large scale GPT models from human feedback.
-
 *Updates Jun/14/2023*
 - Improved sharding for large models
 - Added support for Fully Sharded Data Parallelism (FSDP)
@@ -41,7 +39,7 @@ The tpu_util.sh is a useful script used to start a TPU VM and install dependenci
 # Usage
 
 
-**Run CoH training**
+**Prepare data**
 
 Prepare the feedback data for training. The data should be in the format of `jsonl` files.
 The script `pack_hf.py` can be used to generate the data for training. It takes the raw feedback data and generates the chain of hindsight data.
@@ -70,6 +68,13 @@ The training follows the same procedure as CoH training.
 The generated data will be saved and you will need to specify the path to the data when running the training script.
 
 
+*Note for PyTorch users*
+
+For those interested in using PyTorch training code like [FastChat](https://github.com/lm-sys/FastChat), check out the [coh/data/pack_hf.py](https://github.com/lhao499/chain-of-hindsight/blob/main/coh/data/pack_hf.py) to converts human feedback data into JSONL format, suitable for integration into other codebases.
+
+
+**Run CoH training**
+
 If using LLaMA, the first step is to prepare LLaMA Jax pretrained weights. You can either download official LLaMA weights and convert the official LLaMA checkpoint to Jax weights as the following:
 ``` shell
 python3 -m coh.scripts.convert_checkpoint.py \
@@ -77,7 +82,6 @@ python3 -m coh.scripts.convert_checkpoint.py \
     --output_dir='path/to/output/checkpoint' \
     --streaming=True
 ```
-Or you can download the [OpenLLaMA](https://github.com/openlm-research/open_llama) (an open reproduction of LLaMA by us) Jax checkpoints directly.
 
 Then, run the training script:
 ```shell
@@ -142,12 +146,8 @@ where we specify `include_feedback='p'` to only include positive feedback.
 
 The training follows the same procedure as CoH training.
 
-**Run RLHF baseline**
 
-Not being supported in this codebase, an implementation (in PyTorch) is available at [TRLX](https://github.com/CarperAI/trlx)
-
-
-**Run qualtative evaluation**
+**Run qualtative and qualtative evaluation**
 
 You can manually check out the quality of finetuned models by running a server of the model:
 For instance, to serve a GPT-J model, run:
@@ -180,8 +180,6 @@ python -m coh.coh_serve_gptj \
     --load_checkpoint='Your checkpoint path' \
 ```
 
-**Run quantitative evaluation**
-
 Similarly, once you have a server ready, you can run the evaluation script:
 ```shell
 python -m coh.scripts.lm_eval_harness \
@@ -190,6 +188,11 @@ python -m coh.scripts.lm_eval_harness \
     --shots=0
 ```
 Full list of tasks can be found at [lm-eval-harness](https://github.com/EleutherAI/lm-evaluation-harness).
+
+
+*Note for PyTorch users*
+
+Alternatively, you can also convert the model to a huggingface model using [coh/scripts/convert_checkpoint.py](https://github.com/lhao499/chain-of-hindsight/blob/main/coh/scripts/convert_checkpoint.py), and then run the model using chat interface or evaluation code in huggingface ecosystem.
 
 
 **Human evaluation**
