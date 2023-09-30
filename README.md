@@ -71,6 +71,7 @@ The generated data will be saved and you will need to specify the path to the da
 *Note for PyTorch users*
 
 For those interested in using PyTorch training code like [FastChat](https://github.com/lm-sys/FastChat), check out the [coh/data/pack_hf.py](https://github.com/lhao499/chain-of-hindsight/blob/main/coh/data/pack_hf.py) to converts human feedback data into JSONL format, suitable for integration into other codebases.
+Refer to the [coh/data/doc.md](text preprocessing) for more details on the data processing.
 
 
 **Run CoH training**
